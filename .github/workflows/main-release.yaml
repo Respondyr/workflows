@@ -81,10 +81,16 @@ jobs:
       - name: Update package.json version
         if: inputs.update_package_json && steps.bump.outputs.skip == 'false'
         run: |
+          CURRENT=$(node -p "require('./package.json').version")
+          if [ "$CURRENT" = "${{ steps.bump.outputs.version }}" ]; then
+            echo "package.json already at $CURRENT — skipping"
+            exit 0
+          fi
           npm version "${{ steps.bump.outputs.version }}" --no-git-tag-version
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add package.json package-lock.json
+          git add package.json
+          git add package-lock.json 2>/dev/null || true
           git commit -m "chore: bump version to ${{ steps.bump.outputs.version }} [skip ci]"
           git push
 
