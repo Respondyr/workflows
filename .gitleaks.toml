@@ -1,0 +1,18 @@
+[allowlist]
+  description = "Global allowlist for Undercurrent repos"
+  regexes = [
+    # Test fixtures — not real secrets
+    '''test[-_]secret''',
+    '''example[-_]key''',
+    '''fake[-_]token''',
+    # CI env placeholder values
+    '''test-secret-for-ci''',
+  ]
+  paths = [
+    # Test files
+    '''.*_test\.go''',
+    '''tests/fixtures/.*''',
+    '''tests/conftest\.py''',
+    # Example configs
+    '''\.env\.example''',
+  ]

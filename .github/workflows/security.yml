@@ -1,0 +1,115 @@
+name: Security Scanning
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        description: "Language for dep scanning: go, python, node"
+        required: true
+        type: string
+      image_ref:
+        description: "Docker image ref for Trivy scan (empty to skip)"
+        required: false
+        type: string
+        default: ""
+      python_version:
+        description: "Python version (for pip-audit)"
+        required: false
+        type: string
+        default: "3.12"
+      go_version:
+        description: "Go version (for govulncheck)"
+        required: false
+        type: string
+        default: "1.25"
+      node_version:
+        description: "Node version (for npm audit)"
+        required: false
+        type: string
+        default: "20"
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  gitleaks:
+    name: Secrets Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  dep-scan:
+    name: Dependency Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        if: inputs.language == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go_version }}
+
+      - name: Run govulncheck
+        if: inputs.language == 'go'
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+      - name: Set up Python
+        if: inputs.language == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Run pip-audit
+        if: inputs.language == 'python'
+        run: |
+          pip install pip-audit
+          if [ -f requirements.txt ]; then
+            pip-audit -r requirements.txt --desc on
+          elif [ -f pyproject.toml ]; then
+            pip install -e ".[dev]" 2>/dev/null || pip install -e .
+            pip-audit --desc on
+          fi
+
+      - name: Set up Node.js
+        if: inputs.language == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Run npm audit
+        if: inputs.language == 'node'
+        run: |
+          npm ci
+          npm audit --audit-level=high
+
+  trivy:
+    name: Image Scan
+    if: inputs.image_ref != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ inputs.image_ref }}
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-results.sarif"

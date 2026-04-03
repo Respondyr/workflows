@@ -1,0 +1,125 @@
+name: Python Service CI
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        description: "Service name (e.g. undercurrent-ai)"
+        required: true
+        type: string
+      python_version:
+        description: "Python version"
+        required: false
+        type: string
+        default: "3.12"
+      has_docker:
+        description: "Build and push Docker image on main push"
+        required: false
+        type: boolean
+        default: false
+      install_method:
+        description: "pip (requirements.txt) or editable (pyproject.toml)"
+        required: false
+        type: string
+        default: "pip"
+      src_path:
+        description: "Source path for linting (e.g. src/)"
+        required: false
+        type: string
+        default: "src/"
+      has_tests:
+        description: "Run pytest"
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      image_tag:
+        description: "Docker image tag (git SHA)"
+        value: ${{ jobs.docker.outputs.image_tag }}
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  security:
+    uses: Travbz/undercurrent-workflows/.github/workflows/security.yml@v0
+    with:
+      language: python
+      python_version: ${{ inputs.python_version }}
+    secrets: inherit
+
+  test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Install dependencies (requirements.txt)
+        if: inputs.install_method == 'pip'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff pytest 2>/dev/null || true
+
+      - name: Install dependencies (editable)
+        if: inputs.install_method == 'editable'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint (ruff)
+        run: ruff check ${{ inputs.src_path }}
+        continue-on-error: true
+
+      - name: Test
+        if: inputs.has_tests
+        run: pytest tests/ -v --tb=short
+
+  docker:
+    name: Docker Build & Push
+    if: inputs.has_docker && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, security]
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.service_name }}:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.service_name }}:latest
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.service_name }}:${{ github.sha }}"
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-results.sarif"
