@@ -41,6 +41,7 @@ permissions:
 jobs:
   gitleaks:
     name: Secrets Scan
+    if: inputs.image_ref == ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -54,6 +55,7 @@ jobs:
 
   dep-scan:
     name: Dependency Scan
+    if: inputs.image_ref == ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
