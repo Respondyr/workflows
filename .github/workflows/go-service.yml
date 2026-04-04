@@ -43,6 +43,7 @@ on:
 permissions:
   id-token: write
   contents: read
+  pull-requests: read
   security-events: write
 
 jobs:
@@ -93,7 +94,7 @@ jobs:
 
   docker:
     name: Docker Build & Push
-    if: inputs.has_docker && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: inputs.has_docker
     needs: [test, security]
     runs-on: ubuntu-latest
     outputs:
@@ -149,11 +150,11 @@ jobs:
           push: true
           tags: |
             ${{ steps.meta.outputs.image_ref }}
-            ${{ steps.ecr-login.outputs.registry }}/${{ inputs.service_name }}:latest
+            ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && format('{0}/{1}:latest', steps.ecr-login.outputs.registry, inputs.service_name) || '' }}
 
   image-scan:
     name: Image Security Scan
-    if: inputs.has_docker && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: inputs.has_docker
     needs: docker
     runs-on: ubuntu-latest
     steps:
