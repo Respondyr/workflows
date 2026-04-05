@@ -3,6 +3,11 @@ name: Python Service CI
 on:
   workflow_call:
     inputs:
+      dev_mode:
+        description: "Skip security scans, Docker on PRs, and use single-arch builds to save CI minutes"
+        required: false
+        type: boolean
+        default: false
       service_name:
         description: "Service name (e.g. undercurrent-ai)"
         required: true
@@ -48,6 +53,7 @@ permissions:
 
 jobs:
   security:
+    if: ${{ !inputs.dev_mode }}
     uses: Travbz/undercurrent-workflows/.github/workflows/security.yml@v0
     with:
       language: python
@@ -88,7 +94,7 @@ jobs:
 
   docker:
     name: Docker Build & Push
-    if: inputs.has_docker
+    if: ${{ inputs.has_docker && !(inputs.dev_mode && github.event_name == 'pull_request') }}
     needs: [test, security]
     runs-on: ubuntu-latest
     outputs:
@@ -113,6 +119,7 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Set up QEMU
+        if: ${{ !inputs.dev_mode }}
         uses: docker/setup-qemu-action@v3
 
       - uses: docker/setup-buildx-action@v3
@@ -121,7 +128,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ inputs.dev_mode && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
           push: true
           tags: |
             ${{ steps.meta.outputs.image_ref }}
@@ -129,7 +136,7 @@ jobs:
 
   image-scan:
     name: Image Security Scan
-    if: inputs.has_docker
+    if: ${{ inputs.has_docker && !inputs.dev_mode }}
     needs: docker
     runs-on: ubuntu-latest
     steps:

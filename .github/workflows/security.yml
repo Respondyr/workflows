@@ -3,6 +3,11 @@ name: Security Scanning
 on:
   workflow_call:
     inputs:
+      dev_mode:
+        description: "Skip security scanning to save CI minutes during development"
+        required: false
+        type: boolean
+        default: false
       language:
         description: "Language for dep scanning: go, python, node"
         required: true
@@ -42,6 +47,7 @@ permissions:
 jobs:
   gitleaks:
     name: Secrets Scan
+    if: ${{ !inputs.dev_mode }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -55,6 +61,7 @@ jobs:
 
   dep-scan:
     name: Dependency Scan
+    if: ${{ !inputs.dev_mode }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -119,7 +126,7 @@ jobs:
 
   trivy:
     name: Image Scan
-    if: inputs.image_ref != ''
+    if: ${{ !inputs.dev_mode && inputs.image_ref != '' }}
     runs-on: ubuntu-latest
     steps:
       - name: Configure AWS credentials
