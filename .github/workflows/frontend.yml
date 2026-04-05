@@ -3,6 +3,11 @@ name: Frontend CI
 on:
   workflow_call:
     inputs:
+      dev_mode:
+        description: "Skip security scanning to save CI minutes during development"
+        required: false
+        type: boolean
+        default: false
       node_version:
         description: "Node.js version"
         required: false
@@ -26,6 +31,7 @@ permissions:
 
 jobs:
   security:
+    if: ${{ !inputs.dev_mode }}
     uses: Travbz/undercurrent-workflows/.github/workflows/security.yml@v0
     with:
       language: node
