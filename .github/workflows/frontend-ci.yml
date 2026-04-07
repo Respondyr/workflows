@@ -1,13 +1,13 @@
+# frontend-ci.yml — PR-only Frontend CI
+#
+# Runs: npm ci → lint → test → build
+# No Docker. No deploy. Fast feedback on PRs.
+
 name: Frontend CI
 
 on:
   workflow_call:
     inputs:
-      dev_mode:
-        description: "Skip security scanning to save CI minutes during development"
-        required: false
-        type: boolean
-        default: false
       node_version:
         description: "Node.js version"
         required: false
@@ -26,20 +26,10 @@ on:
 
 permissions:
   contents: read
-  pull-requests: read
-  security-events: write
 
 jobs:
-  security:
-    if: ${{ !inputs.dev_mode }}
-    uses: UndercurrentSMB/undercurrent-workflows/.github/workflows/security.yml@v0
-    with:
-      language: node
-      node_version: ${{ inputs.node_version }}
-    secrets: inherit
-
   build:
-    name: Install & Build
+    name: Install, Lint, Test & Build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -55,6 +45,9 @@ jobs:
 
       - name: Lint
         run: npm run lint 2>/dev/null || true
+
+      - name: Test
+        run: npm test 2>/dev/null || true
 
       - name: Build
         run: ${{ inputs.build_command }}

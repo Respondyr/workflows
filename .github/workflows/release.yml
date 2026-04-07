@@ -24,11 +24,12 @@ jobs:
 
           # Map component name → workflow file path
           declare -A COMPONENTS=(
-            [go-service]=".github/workflows/go-service.yml"
-            [python-service]=".github/workflows/python-service.yml"
-            [frontend]=".github/workflows/frontend.yml"
+            [go-ci]=".github/workflows/go-ci.yml"
+            [python-ci]=".github/workflows/python-ci.yml"
+            [frontend-ci]=".github/workflows/frontend-ci.yml"
+            [deploy]=".github/workflows/deploy.yml"
             [security]=".github/workflows/security.yml"
-            [main-release]=".github/workflows/main-release.yaml"
+            [e2e-tests]=".github/workflows/e2e-tests.yml"
           )
 
           for COMPONENT in "${!COMPONENTS[@]}"; do
