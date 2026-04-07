@@ -256,15 +256,25 @@ jobs:
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
+      - name: Compute image tags
+        id: tags
+        run: |
+          {
+            echo "tags<<EOF"
+            echo "${{ steps.meta.outputs.image_ref }}"
+            if [ "${{ github.event_name }}" != "pull_request" ]; then
+              echo "${{ steps.ecr-login.outputs.registry }}/${{ inputs.service_name }}:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ${{ steps.meta.outputs.image_ref }}
-            ${{ steps.ecr-login.outputs.registry }}/${{ inputs.service_name }}:latest
+          tags: ${{ steps.tags.outputs.tags }}
 
   # ──────────────────────────────────────────────
   # 3. DEPLOY DEV — ArgoCD API: set tag → sync → verify
@@ -364,8 +374,8 @@ jobs:
     name: Release
     needs: [test, security, docker, deploy-dev, verify]
     # Run even when optional jobs (docker, deploy-dev, verify) are skipped.
-    # Do NOT run if any required job failed.
-    if: ${{ always() && !failure() && !cancelled() }}
+    # Do NOT run if any required job failed. Skip on PRs — only release on merge.
+    if: ${{ always() && !failure() && !cancelled() && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.bump.outputs.tag }}
@@ -466,7 +476,7 @@ jobs:
   retag:
     name: Retag Image
     needs: [release, docker]
-    if: ${{ always() && !failure() && !cancelled() && inputs.has_docker && needs.release.outputs.skip == 'false' }}
+    if: ${{ always() && !failure() && !cancelled() && inputs.has_docker && needs.release.outputs.skip == 'false' && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     steps:
       - name: Configure AWS credentials
@@ -511,7 +521,7 @@ jobs:
   deploy-prod:
     name: Deploy to Prod
     needs: [retag, release]
-    if: ${{ always() && !failure() && !cancelled() && inputs.has_docker && inputs.argocd_enabled && needs.release.outputs.skip == 'false' }}
+    if: ${{ always() && !failure() && !cancelled() && inputs.has_docker && inputs.argocd_enabled && needs.release.outputs.skip == 'false' && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
