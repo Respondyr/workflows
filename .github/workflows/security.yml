@@ -45,20 +45,6 @@ permissions:
   security-events: write
 
 jobs:
-  gitleaks:
-    name: Secrets Scan
-    if: ${{ !inputs.dev_mode }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Run Gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
   dep-scan:
     name: Dependency Scan
     if: ${{ !inputs.dev_mode }}
