@@ -125,6 +125,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: ${{ inputs.go_version }}
+          cache: true
 
       - name: Go vet
         if: inputs.language == 'go'
@@ -239,7 +240,6 @@ jobs:
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
       - name: Compute image tags
@@ -258,9 +258,11 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/arm64
           push: true
           tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   # ──────────────────────────────────────────────
   # 3. DEPLOY DEV — ArgoCD API: set tag → sync → verify
