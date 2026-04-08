@@ -285,6 +285,9 @@ jobs:
     if: ${{ inputs.has_docker && inputs.argocd_enabled }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    concurrency:
+      group: argocd-dev-${{ inputs.service_name }}
+      cancel-in-progress: false
     env:
       ARGOCD_SERVER: argocd-dev.undercurrentsmb.com
     steps:
@@ -313,7 +316,22 @@ jobs:
           argocd app set "${{ inputs.service_name }}" \
             -p "base-service.deployment.image.tag=${{ github.sha }}" \
             --grpc-web --insecure
-          argocd app sync "${{ inputs.service_name }}" --grpc-web --insecure --prune
+
+          # Retry sync up to 5 times with backoff to handle "another operation in progress"
+          for attempt in 1 2 3 4 5; do
+            if argocd app sync "${{ inputs.service_name }}" --grpc-web --insecure --prune 2>&1; then
+              echo "Sync started on attempt $attempt"
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "::error::Sync failed after 5 attempts"
+              exit 1
+            fi
+            BACKOFF=$((attempt * 10))
+            echo "Sync attempt $attempt failed, retrying in ${BACKOFF}s..."
+            sleep "$BACKOFF"
+          done
+
           argocd app wait "${{ inputs.service_name }}" --health --sync --timeout 300 --grpc-web --insecure
 
       - name: Verify deployment health
@@ -524,6 +542,9 @@ jobs:
     if: ${{ always() && !failure() && !cancelled() && inputs.has_docker && inputs.argocd_enabled && needs.release.outputs.skip == 'false' && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    concurrency:
+      group: argocd-prod-${{ inputs.service_name }}
+      cancel-in-progress: false
     env:
       ARGOCD_SERVER: argocd.undercurrentsmb.com
     steps:
@@ -553,7 +574,22 @@ jobs:
           argocd app set "${{ inputs.service_name }}" \
             -p "base-service.deployment.image.tag=$TAG" \
             --grpc-web --insecure
-          argocd app sync "${{ inputs.service_name }}" --grpc-web --insecure --prune
+
+          # Retry sync up to 5 times with backoff to handle "another operation in progress"
+          for attempt in 1 2 3 4 5; do
+            if argocd app sync "${{ inputs.service_name }}" --grpc-web --insecure --prune 2>&1; then
+              echo "Sync started on attempt $attempt"
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "::error::Sync failed after 5 attempts"
+              exit 1
+            fi
+            BACKOFF=$((attempt * 10))
+            echo "Sync attempt $attempt failed, retrying in ${BACKOFF}s..."
+            sleep "$BACKOFF"
+          done
+
           argocd app wait "${{ inputs.service_name }}" --health --sync --timeout 300 --grpc-web --insecure
 
       - name: Verify deployment health
