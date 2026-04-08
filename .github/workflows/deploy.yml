@@ -286,7 +286,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency:
-      group: argocd-dev-${{ inputs.service_name }}
+      group: argocd-dev
       cancel-in-progress: false
     env:
       ARGOCD_SERVER: argocd-dev.undercurrentsmb.com
@@ -543,7 +543,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency:
-      group: argocd-prod-${{ inputs.service_name }}
+      group: argocd-prod
       cancel-in-progress: false
     env:
       ARGOCD_SERVER: argocd.undercurrentsmb.com
@@ -601,3 +601,34 @@ jobs:
             exit 1
           fi
           echo "Prod deployment healthy"
+
+  # ──────────────────────────────────────────────
+  # 8. NOTIFY — Discord alert on any job failure
+  # ──────────────────────────────────────────────
+  notify-failure:
+    name: Notify Deploy Failure
+    needs: [test, security, docker, deploy-dev, verify, release, retag, deploy-prod]
+    if: ${{ always() && failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine failed jobs
+        id: failed
+        run: |
+          FAILED_JOBS=""
+          if [ "${{ needs.test.result }}" = "failure" ]; then FAILED_JOBS="${FAILED_JOBS} test"; fi
+          if [ "${{ needs.security.result }}" = "failure" ]; then FAILED_JOBS="${FAILED_JOBS} security"; fi
+          if [ "${{ needs.docker.result }}" = "failure" ]; then FAILED_JOBS="${FAILED_JOBS} docker"; fi
+          if [ "${{ needs.deploy-dev.result }}" = "failure" ]; then FAILED_JOBS="${FAILED_JOBS} deploy-dev"; fi
+          if [ "${{ needs.verify.result }}" = "failure" ]; then FAILED_JOBS="${FAILED_JOBS} verify"; fi
+          if [ "${{ needs.release.result }}" = "failure" ]; then FAILED_JOBS="${FAILED_JOBS} release"; fi
+          if [ "${{ needs.retag.result }}" = "failure" ]; then FAILED_JOBS="${FAILED_JOBS} retag"; fi
+          if [ "${{ needs.deploy-prod.result }}" = "failure" ]; then FAILED_JOBS="${FAILED_JOBS} deploy-prod"; fi
+          FAILED_JOBS=$(echo "$FAILED_JOBS" | xargs | sed 's/ /, /g')
+          echo "jobs=$FAILED_JOBS" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Discord on failure
+        run: |
+          curl -H "Content-Type: application/json" \
+            -X POST \
+            -d "{\"embeds\":[{\"title\":\"Deploy Failed\",\"description\":\"**Service:** ${{ inputs.service_name }}\n**Repo:** ${{ github.repository }}\n**Branch:** ${{ github.ref_name }}\n**Commit:** ${{ github.sha }}\n**Actor:** ${{ github.actor }}\n**Failed jobs:** ${{ steps.failed.outputs.jobs }}\n**Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\",\"color\":16711680}]}" \
+            "${{ secrets.DISCORD_DEPLOY_WEBHOOK }}"
