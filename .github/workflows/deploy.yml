@@ -50,7 +50,7 @@ on:
         type: string
         default: "1.25"
       has_auth_dep:
-        description: "Clone undercurrent-auth-go for replace directive"
+        description: "Clone auth-go for replace directive"
         required: false
         type: boolean
         default: false
@@ -116,15 +116,15 @@ jobs:
         with:
           app-id: ${{ secrets.GH_APP_ID }}
           private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
-          owner: UndercurrentSMB
-          repositories: undercurrent-auth-go
+          owner: Respondyr
+          repositories: auth-go
 
       - name: Clone auth-go for replace directive
         if: inputs.language == 'go' && inputs.has_auth_dep
         run: |
           git clone --depth 1 \
-            https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/UndercurrentSMB/undercurrent-auth-go.git \
-            ${{ github.workspace }}/../undercurrent-auth-go
+            https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/Respondyr/auth-go.git \
+            ${{ github.workspace }}/../auth-go
 
       - name: Set up Go
         if: inputs.language == 'go'
@@ -219,17 +219,17 @@ jobs:
         with:
           app-id: ${{ secrets.GH_APP_ID }}
           private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
-          owner: UndercurrentSMB
-          repositories: undercurrent-auth-go
+          owner: Respondyr
+          repositories: auth-go
 
       - name: Clone and stage auth-go for Docker build
         if: inputs.has_auth_dep
         run: |
           git clone --depth 1 \
-            https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/UndercurrentSMB/undercurrent-auth-go.git \
-            /tmp/undercurrent-auth-go
+            https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/Respondyr/auth-go.git \
+            /tmp/auth-go
           mkdir -p .deps
-          cp -r /tmp/undercurrent-auth-go .deps/undercurrent-auth-go
+          cp -r /tmp/auth-go .deps/auth-go
 
       - name: Compute image metadata
         id: meta
@@ -283,7 +283,7 @@ jobs:
       group: argocd-dev
       cancel-in-progress: false
     env:
-      ARGOCD_SERVER: argocd-dev.undercurrentsmb.com
+      ARGOCD_SERVER: argocd-dev.respondyr.com
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -294,7 +294,7 @@ jobs:
       - name: Fetch ArgoCD token
         run: |
           ARGOCD_AUTH_TOKEN=$(aws secretsmanager get-secret-value \
-            --secret-id dev/undercurrentsmb/master-list \
+            --secret-id dev/platform/master-list \
             --query 'SecretString' --output text \
             --region ${{ vars.AWS_REGION }} | jq -r '.["ARGOCD-DEV-TOKEN"]')
           echo "::add-mask::$ARGOCD_AUTH_TOKEN"
@@ -362,8 +362,8 @@ jobs:
 
       - name: Run e2e tests
         env:
-          BASE_URL: https://dev.undercurrentsmb.com
-          API_URL: https://dev-api.undercurrentsmb.com
+          BASE_URL: https://dev.respondyr.com
+          API_URL: https://dev-api.respondyr.com
           CI: "true"
         run: npx playwright test tests/e2e/
 
@@ -540,7 +540,7 @@ jobs:
       group: argocd-prod
       cancel-in-progress: false
     env:
-      ARGOCD_SERVER: argocd.undercurrentsmb.com
+      ARGOCD_SERVER: argocd.respondyr.com
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -551,7 +551,7 @@ jobs:
       - name: Fetch ArgoCD token
         run: |
           ARGOCD_AUTH_TOKEN=$(aws secretsmanager get-secret-value \
-            --secret-id prod/undercurrentsmb/master-list \
+            --secret-id prod/platform/master-list \
             --query 'SecretString' --output text \
             --region ${{ vars.AWS_REGION }} | jq -r '.["ARGOCD-PROD-TOKEN"]')
           echo "::add-mask::$ARGOCD_AUTH_TOKEN"

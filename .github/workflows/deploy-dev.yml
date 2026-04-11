@@ -30,7 +30,7 @@ jobs:
       group: argocd-dev
       cancel-in-progress: false
     env:
-      ARGOCD_SERVER: argocd-dev.undercurrentsmb.com
+      ARGOCD_SERVER: argocd-dev.respondyr.com
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -41,7 +41,7 @@ jobs:
       - name: Fetch ArgoCD token
         run: |
           ARGOCD_AUTH_TOKEN=$(aws secretsmanager get-secret-value \
-            --secret-id dev/undercurrentsmb/master-list \
+            --secret-id dev/platform/master-list \
             --query 'SecretString' --output text \
             --region ${{ vars.AWS_REGION }} | jq -r '.["ARGOCD-DEV-TOKEN"]')
           echo "::add-mask::$ARGOCD_AUTH_TOKEN"

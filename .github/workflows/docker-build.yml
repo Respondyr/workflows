@@ -14,7 +14,7 @@ on:
         required: true
         type: string
       has_auth_dep:
-        description: "Clone undercurrent-auth-go for replace directive"
+        description: "Clone auth-go for replace directive"
         required: false
         type: boolean
         default: false
@@ -52,17 +52,17 @@ jobs:
         with:
           app-id: ${{ secrets.GH_APP_ID }}
           private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
-          owner: UndercurrentSMB
-          repositories: undercurrent-auth-go
+          owner: Respondyr
+          repositories: auth-go
 
       - name: Clone and stage auth-go for Docker build
         if: inputs.has_auth_dep
         run: |
           git clone --depth 1 \
-            https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/UndercurrentSMB/undercurrent-auth-go.git \
-            /tmp/undercurrent-auth-go
+            https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/Respondyr/auth-go.git \
+            /tmp/auth-go
           mkdir -p .deps
-          cp -r /tmp/undercurrent-auth-go .deps/undercurrent-auth-go
+          cp -r /tmp/auth-go .deps/auth-go
 
       - name: Compute image metadata
         id: meta

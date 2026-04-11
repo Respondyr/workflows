@@ -16,12 +16,12 @@ on:
         description: "Base URL for the application under test"
         required: false
         type: string
-        default: "https://dev.undercurrentsmb.com"
+        default: "https://dev.respondyr.com"
       api_url:
         description: "API base URL"
         required: false
         type: string
-        default: "https://dev-api.undercurrentsmb.com"
+        default: "https://dev-api.respondyr.com"
       dev_mode:
         description: "Skip expensive steps to save CI minutes"
         required: false
@@ -86,11 +86,11 @@ jobs:
         env:
           BASE_URL: ${{ inputs.base_url }}
           API_URL: ${{ inputs.api_url }}
-          E2E_STARTER_EMAIL: "travis+starter@undercurrentsmb.com"
-          E2E_PRO_EMAIL: "travis+pro@undercurrentsmb.com"
-          E2E_BUSINESS_EMAIL: "travis+business@undercurrentsmb.com"
-          E2E_FLEET_EMAIL: "travis+fleet@undercurrentsmb.com"
-          E2E_ADMIN_EMAIL: "travis@undercurrentsmb.com"
+          E2E_STARTER_EMAIL: "travis+starter@respondyr.com"
+          E2E_PRO_EMAIL: "travis+pro@respondyr.com"
+          E2E_BUSINESS_EMAIL: "travis+business@respondyr.com"
+          E2E_FLEET_EMAIL: "travis+fleet@respondyr.com"
+          E2E_ADMIN_EMAIL: "travis@respondyr.com"
           E2E_STARTER_PASSWORD: ${{ secrets.E2E_STARTER_PASSWORD }}
           E2E_PRO_PASSWORD: ${{ secrets.E2E_PRO_PASSWORD }}
           E2E_BUSINESS_PASSWORD: ${{ secrets.E2E_BUSINESS_PASSWORD }}
