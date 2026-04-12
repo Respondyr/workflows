@@ -280,7 +280,7 @@ jobs:
   deploy-dev:
     name: Deploy to Dev
     needs: docker
-    if: ${{ inputs.has_docker && inputs.argocd_enabled }}
+    if: ${{ always() && !failure() && !cancelled() && inputs.has_docker && inputs.argocd_enabled }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency:
