@@ -537,7 +537,7 @@ jobs:
   deploy-prod:
     name: Deploy to Prod
     needs: [retag, release]
-    if: ${{ always() && !failure() && !cancelled() && inputs.has_docker && inputs.argocd_enabled && needs.release.outputs.skip == 'false' && github.event_name != 'pull_request' }}
+    if: false  # Prod deploys are manual — Travis triggers via deploy-prod.yml in each repo
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency:
