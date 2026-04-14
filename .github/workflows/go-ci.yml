@@ -18,11 +18,21 @@ on:
         required: false
         type: boolean
         default: false
+      has_rabbit_dep:
+        description: "Clone shared-go-rabbit for replace directive"
+        required: false
+        type: boolean
+        default: false
       build_target:
         description: "Go build target (e.g. ./cmd/server, ./...)"
         required: false
         type: string
         default: "./cmd/server"
+      lint_raw_amqp:
+        description: "Fail if Go files outside internal/rabbit/ call raw AMQP publish/consume (opt-in)"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -35,14 +45,14 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Generate GitHub App token
-        if: inputs.has_auth_dep
+        if: inputs.has_auth_dep || inputs.has_rabbit_dep
         id: app-token
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ secrets.GH_APP_ID }}
           private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
           owner: Respondyr
-          repositories: auth-go
+          repositories: auth-go,shared-go-rabbit
 
       - name: Clone auth-go for replace directive
         if: inputs.has_auth_dep
@@ -50,6 +60,13 @@ jobs:
           git clone --depth 1 \
             https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/Respondyr/auth-go.git \
             ${{ github.workspace }}/../auth-go
+
+      - name: Clone shared-go-rabbit for replace directive
+        if: inputs.has_rabbit_dep
+        run: |
+          git clone --depth 1 \
+            https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/Respondyr/shared-go-rabbit.git \
+            ${{ github.workspace }}/../shared-go-rabbit
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -65,3 +82,28 @@ jobs:
 
       - name: Build
         run: go build -o /dev/null ${{ inputs.build_target }}
+
+      - name: Lint raw AMQP calls
+        if: inputs.lint_raw_amqp
+        run: |
+          # Fail if any Go file outside internal/rabbit/ calls raw AMQP
+          # publish or consume methods directly. Services should use
+          # shared-go-rabbit's PublishJSON and HandleDelivery instead.
+          PUBLISH_HITS=$(grep -rn --include='*.go' '\.PublishWithContext(' . \
+            --exclude-dir=vendor --exclude-dir=.git \
+            | grep -v 'internal/rabbit/' \
+            || true)
+
+          CONSUME_HITS=$(grep -rn --include='*.go' 'ch\.Consume(' . \
+            --exclude-dir=vendor --exclude-dir=.git \
+            | grep -v 'internal/rabbit/' \
+            || true)
+
+          HITS="${PUBLISH_HITS}${CONSUME_HITS}"
+          if [ -n "$HITS" ]; then
+            echo "::error::Raw AMQP calls found — use shared-go-rabbit (PublishJSON / HandleDelivery) instead:"
+            echo "$PUBLISH_HITS"
+            echo "$CONSUME_HITS"
+            exit 1
+          fi
+          echo "No raw AMQP calls found outside internal/rabbit/"

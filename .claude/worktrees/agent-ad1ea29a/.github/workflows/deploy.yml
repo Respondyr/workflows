@@ -38,11 +38,6 @@ on:
         required: false
         type: boolean
         default: false
-      skip_tests:
-        description: "Skip test job (PR CI already validates before merge)"
-        required: false
-        type: boolean
-        default: false
       # Go-specific
       go_version:
         description: "Go version"
@@ -50,12 +45,7 @@ on:
         type: string
         default: "1.25"
       has_auth_dep:
-        description: "Clone auth-go for replace directive"
-        required: false
-        type: boolean
-        default: false
-      has_rabbit_dep:
-        description: "Clone shared-go-rabbit for replace directive"
+        description: "Clone undercurrent-auth-go for replace directive"
         required: false
         type: boolean
         default: false
@@ -101,6 +91,7 @@ permissions:
   id-token: write
   contents: write
   pull-requests: read
+  security-events: write
 
 jobs:
   # ──────────────────────────────────────────────
@@ -108,42 +99,33 @@ jobs:
   # ──────────────────────────────────────────────
   test:
     name: Test
-    if: ${{ !inputs.skip_tests }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       # --- Go ---
       - name: Generate GitHub App token
-        if: inputs.language == 'go' && (inputs.has_auth_dep || inputs.has_rabbit_dep)
+        if: inputs.language == 'go' && inputs.has_auth_dep
         id: app-token
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ secrets.GH_APP_ID }}
           private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
-          owner: Respondyr
-          repositories: auth-go,shared-go-rabbit
+          owner: UndercurrentSMB
+          repositories: undercurrent-auth-go
 
       - name: Clone auth-go for replace directive
         if: inputs.language == 'go' && inputs.has_auth_dep
         run: |
           git clone --depth 1 \
-            https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/Respondyr/auth-go.git \
-            ${{ github.workspace }}/../auth-go
-
-      - name: Clone shared-go-rabbit for replace directive
-        if: inputs.language == 'go' && inputs.has_rabbit_dep
-        run: |
-          git clone --depth 1 \
-            https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/Respondyr/shared-go-rabbit.git \
-            ${{ github.workspace }}/../shared-go-rabbit
+            https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/UndercurrentSMB/undercurrent-auth-go.git \
+            ${{ github.workspace }}/../undercurrent-auth-go
 
       - name: Set up Go
         if: inputs.language == 'go'
         uses: actions/setup-go@v5
         with:
           go-version: ${{ inputs.go_version }}
-          cache: true
 
       - name: Go vet
         if: inputs.language == 'go'
@@ -160,7 +142,7 @@ jobs:
       # --- Python ---
       - name: Set up Python
         if: inputs.language == 'python'
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ inputs.python_version }}
 
@@ -170,10 +152,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install ruff pytest 2>/dev/null || true
-
-      - name: Configure git for private deps
-        if: inputs.language == 'python' && inputs.install_method == 'editable'
-        run: git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
 
       - name: Install Python deps (editable)
         if: inputs.language == 'python' && inputs.install_method == 'editable'
@@ -215,46 +193,50 @@ jobs:
         run: ${{ inputs.build_command }}
 
   # ──────────────────────────────────────────────
+  # 1b. SECURITY — gitleaks + dependency scan
+  # ──────────────────────────────────────────────
+  security:
+    uses: UndercurrentSMB/undercurrent-workflows/.github/workflows/security.yml@main
+    with:
+      language: ${{ inputs.language }}
+      go_version: ${{ inputs.go_version }}
+      python_version: ${{ inputs.python_version }}
+      node_version: ${{ inputs.node_version }}
+      has_auth_dep: ${{ inputs.has_auth_dep }}
+    secrets: inherit
+
+  # ──────────────────────────────────────────────
   # 2. BUILD — Docker image, tagged with git SHA
   # ──────────────────────────────────────────────
   docker:
     name: Docker Build & Push
-    needs: [test]
-    if: ${{ always() && !failure() && !cancelled() && inputs.has_docker }}
+    needs: [test, security]
+    if: ${{ inputs.has_docker }}
     runs-on: ubuntu-latest
     outputs:
       image_tag: ${{ github.sha }}
       image_ref: ${{ steps.meta.outputs.image_ref }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Generate GitHub App token
-        if: inputs.has_auth_dep || inputs.has_rabbit_dep
+        if: inputs.has_auth_dep
         id: app-token
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ secrets.GH_APP_ID }}
           private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
-          owner: Respondyr
-          repositories: auth-go,shared-go-rabbit
+          owner: UndercurrentSMB
+          repositories: undercurrent-auth-go
 
       - name: Clone and stage auth-go for Docker build
         if: inputs.has_auth_dep
         run: |
           git clone --depth 1 \
-            https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/Respondyr/auth-go.git \
-            /tmp/auth-go
+            https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/UndercurrentSMB/undercurrent-auth-go.git \
+            /tmp/undercurrent-auth-go
           mkdir -p .deps
-          cp -r /tmp/auth-go .deps/auth-go
-
-      - name: Clone and stage shared-go-rabbit for Docker build
-        if: inputs.has_rabbit_dep
-        run: |
-          git clone --depth 1 \
-            https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/Respondyr/shared-go-rabbit.git \
-            /tmp/shared-go-rabbit
-          mkdir -p .deps
-          cp -r /tmp/shared-go-rabbit .deps/shared-go-rabbit
+          cp -r /tmp/undercurrent-auth-go .deps/undercurrent-auth-go
 
       - name: Compute image metadata
         id: meta
@@ -262,7 +244,7 @@ jobs:
           echo "image_ref=${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION || 'us-east-2' }}.amazonaws.com/${{ inputs.service_name }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
@@ -271,7 +253,8 @@ jobs:
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
 
       - name: Compute image tags
         id: tags
@@ -286,14 +269,12 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Build and push
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/arm64
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.tags.outputs.tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
   # ──────────────────────────────────────────────
   # 3. DEPLOY DEV — ArgoCD API: set tag → sync → verify
@@ -301,17 +282,17 @@ jobs:
   deploy-dev:
     name: Deploy to Dev
     needs: docker
-    if: ${{ always() && !failure() && !cancelled() && inputs.has_docker && inputs.argocd_enabled }}
+    if: ${{ inputs.has_docker && inputs.argocd_enabled }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency:
       group: argocd-dev
       cancel-in-progress: false
     env:
-      ARGOCD_SERVER: argocd-dev.respondyr.com
+      ARGOCD_SERVER: argocd-dev.undercurrentsmb.com
     steps:
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
@@ -319,7 +300,7 @@ jobs:
       - name: Fetch ArgoCD token
         run: |
           ARGOCD_AUTH_TOKEN=$(aws secretsmanager get-secret-value \
-            --secret-id dev/platform/master-list \
+            --secret-id dev/undercurrentsmb/master-list \
             --query 'SecretString' --output text \
             --region ${{ vars.AWS_REGION }} | jq -r '.["ARGOCD-DEV-TOKEN"]')
           echo "::add-mask::$ARGOCD_AUTH_TOKEN"
@@ -373,7 +354,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -387,8 +368,8 @@ jobs:
 
       - name: Run e2e tests
         env:
-          BASE_URL: https://dev.respondyr.com
-          API_URL: https://dev-api.respondyr.com
+          BASE_URL: https://dev.undercurrentsmb.com
+          API_URL: https://dev-api.undercurrentsmb.com
           CI: "true"
         run: npx playwright test tests/e2e/
 
@@ -409,7 +390,7 @@ jobs:
   # ──────────────────────────────────────────────
   release:
     name: Release
-    needs: [test, docker, deploy-dev, verify]
+    needs: [test, security, docker, deploy-dev, verify]
     # Run even when optional jobs (docker, deploy-dev, verify) are skipped.
     # Do NOT run if any required job failed. Skip on PRs — only release on merge.
     if: ${{ always() && !failure() && !cancelled() && github.event_name != 'pull_request' }}
@@ -418,7 +399,7 @@ jobs:
       tag: ${{ steps.bump.outputs.tag }}
       skip: ${{ steps.bump.outputs.skip }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -517,7 +498,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
@@ -558,17 +539,17 @@ jobs:
   deploy-prod:
     name: Deploy to Prod
     needs: [retag, release]
-    if: false  # Prod deploys are manual — Travis triggers via deploy-prod.yml in each repo
+    if: ${{ always() && !failure() && !cancelled() && inputs.has_docker && inputs.argocd_enabled && needs.release.outputs.skip == 'false' && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency:
       group: argocd-prod
       cancel-in-progress: false
     env:
-      ARGOCD_SERVER: argocd.respondyr.com
+      ARGOCD_SERVER: argocd.undercurrentsmb.com
     steps:
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
@@ -576,7 +557,7 @@ jobs:
       - name: Fetch ArgoCD token
         run: |
           ARGOCD_AUTH_TOKEN=$(aws secretsmanager get-secret-value \
-            --secret-id prod/platform/master-list \
+            --secret-id prod/undercurrentsmb/master-list \
             --query 'SecretString' --output text \
             --region ${{ vars.AWS_REGION }} | jq -r '.["ARGOCD-PROD-TOKEN"]')
           echo "::add-mask::$ARGOCD_AUTH_TOKEN"
@@ -626,7 +607,7 @@ jobs:
   # ──────────────────────────────────────────────
   notify-failure:
     name: Notify Deploy Failure
-    needs: [test, docker, deploy-dev, verify, release, retag, deploy-prod]
+    needs: [test, security, docker, deploy-dev, verify, release, retag, deploy-prod]
     if: ${{ always() && failure() && !cancelled() }}
     runs-on: ubuntu-latest
     steps:

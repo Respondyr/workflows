@@ -1,0 +1,141 @@
+name: Security Scanning
+
+on:
+  workflow_call:
+    inputs:
+      dev_mode:
+        description: "Skip security scanning to save CI minutes during development"
+        required: false
+        type: boolean
+        default: false
+      language:
+        description: "Language for dep scanning: go, python, node"
+        required: true
+        type: string
+      image_ref:
+        description: "Docker image ref for Trivy scan (empty to skip)"
+        required: false
+        type: string
+        default: ""
+      python_version:
+        description: "Python version (for pip-audit)"
+        required: false
+        type: string
+        default: "3.12"
+      go_version:
+        description: "Go version (for govulncheck)"
+        required: false
+        type: string
+        default: "1.25"
+      has_auth_dep:
+        description: "Clone undercurrent-auth-go for replace directive"
+        required: false
+        type: boolean
+        default: false
+      node_version:
+        description: "Node version (for npm audit)"
+        required: false
+        type: string
+        default: "20"
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: read
+  security-events: write
+
+jobs:
+  dep-scan:
+    name: Dependency Scan
+    if: ${{ !inputs.dev_mode }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        if: inputs.language == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go_version }}
+
+      - name: Generate GitHub App token
+        if: inputs.language == 'go' && inputs.has_auth_dep
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: UndercurrentSMB
+          repositories: undercurrent-auth-go
+
+      - name: Clone auth-go for replace directive
+        if: inputs.language == 'go' && inputs.has_auth_dep
+        run: |
+          git clone --depth 1 \
+            https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/UndercurrentSMB/undercurrent-auth-go.git \
+            ${{ github.workspace }}/../undercurrent-auth-go
+
+      - name: Run govulncheck
+        if: inputs.language == 'go'
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+      - name: Set up Python
+        if: inputs.language == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Run pip-audit
+        if: inputs.language == 'python'
+        run: |
+          pip install pip-audit
+          if [ -f requirements.txt ]; then
+            pip-audit -r requirements.txt --desc on
+          elif [ -f pyproject.toml ]; then
+            pip install -e ".[dev]" 2>/dev/null || pip install -e .
+            pip-audit --desc on
+          fi
+
+      - name: Set up Node.js
+        if: inputs.language == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Run npm audit
+        if: inputs.language == 'node'
+        run: |
+          npm ci
+          npm audit --audit-level=high
+
+  trivy:
+    name: Image Scan
+    if: ${{ !inputs.dev_mode && inputs.image_ref != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ inputs.image_ref }}
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-results.sarif"

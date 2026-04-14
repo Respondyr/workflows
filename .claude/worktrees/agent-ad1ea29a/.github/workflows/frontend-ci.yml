@@ -1,0 +1,54 @@
+# frontend-ci.yml — PR-only Frontend CI
+#
+# Runs: npm ci → lint → test → build
+# No Docker. No deploy. Fast feedback on PRs.
+
+name: Frontend CI
+
+on:
+  workflow_call:
+    inputs:
+      node_version:
+        description: "Node.js version"
+        required: false
+        type: string
+        default: "20"
+      build_command:
+        description: "Build command"
+        required: false
+        type: string
+        default: "npm run build"
+      build_env:
+        description: "JSON object of env vars for build step"
+        required: false
+        type: string
+        default: "{}"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Install, Lint, Test & Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint 2>/dev/null || true
+
+      - name: Test
+        run: npm test 2>/dev/null || true
+
+      - name: Build
+        run: ${{ inputs.build_command }}
+        env: ${{ fromJSON(inputs.build_env) }}

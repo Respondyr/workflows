@@ -1,0 +1,66 @@
+# python-ci.yml — PR-only Python CI
+#
+# Runs: pip install → ruff check → pytest
+# No Docker. No deploy. Fast feedback on PRs.
+
+name: Python CI
+
+on:
+  workflow_call:
+    inputs:
+      python_version:
+        description: "Python version"
+        required: false
+        type: string
+        default: "3.12"
+      install_method:
+        description: "pip (requirements.txt) or editable (pyproject.toml)"
+        required: false
+        type: string
+        default: "pip"
+      src_path:
+        description: "Source path for linting"
+        required: false
+        type: string
+        default: "src/"
+      has_tests:
+        description: "Run pytest"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Install dependencies (pip)
+        if: inputs.install_method == 'pip'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff pytest 2>/dev/null || true
+
+      - name: Install dependencies (editable)
+        if: inputs.install_method == 'editable'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check ${{ inputs.src_path }}
+        continue-on-error: true
+
+      - name: Test
+        if: inputs.has_tests
+        run: pytest tests/ -v --tb=short
