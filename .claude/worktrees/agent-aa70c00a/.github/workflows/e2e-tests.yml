@@ -1,0 +1,121 @@
+name: E2E Tests (Playwright)
+
+on:
+  workflow_call:
+    inputs:
+      test_path:
+        description: "Path to Playwright test files (e.g. tests/e2e/, e2e/)"
+        required: true
+        type: string
+      node_version:
+        description: "Node.js version"
+        required: false
+        type: string
+        default: "20"
+      base_url:
+        description: "Base URL for the application under test"
+        required: false
+        type: string
+        default: "https://dev.undercurrentsmb.com"
+      api_url:
+        description: "API base URL"
+        required: false
+        type: string
+        default: "https://dev-api.undercurrentsmb.com"
+      dev_mode:
+        description: "Skip expensive steps to save CI minutes"
+        required: false
+        type: boolean
+        default: false
+      config_path:
+        description: "Path to playwright.config.ts (defaults to repo root)"
+        required: false
+        type: string
+        default: "playwright.config.ts"
+      shard_total:
+        description: "Total number of shards for parallel execution (1 = no sharding)"
+        required: false
+        type: number
+        default: 1
+    secrets:
+      E2E_STARTER_PASSWORD:
+        description: "Password for starter tier test account"
+        required: true
+      E2E_PRO_PASSWORD:
+        description: "Password for pro tier test account"
+        required: true
+      E2E_BUSINESS_PASSWORD:
+        description: "Password for business tier test account"
+        required: true
+      E2E_FLEET_PASSWORD:
+        description: "Password for fleet tier test account"
+        required: true
+      E2E_ADMIN_PASSWORD:
+        description: "Password for admin test account"
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  playwright:
+    name: "E2E (${{ matrix.shard }}/${{ inputs.shard_total }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(format('[{0}]', join(fromJson(format('[{0}]', inputs.shard_total == 1 && '1' || '1,2,3,4')), ','))) }}
+    container:
+      image: mcr.microsoft.com/playwright:v1.50.0-noble
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Run Playwright tests
+        env:
+          BASE_URL: ${{ inputs.base_url }}
+          API_URL: ${{ inputs.api_url }}
+          E2E_STARTER_EMAIL: "travis+starter@undercurrentsmb.com"
+          E2E_PRO_EMAIL: "travis+pro@undercurrentsmb.com"
+          E2E_BUSINESS_EMAIL: "travis+business@undercurrentsmb.com"
+          E2E_FLEET_EMAIL: "travis+fleet@undercurrentsmb.com"
+          E2E_ADMIN_EMAIL: "travis@undercurrentsmb.com"
+          E2E_STARTER_PASSWORD: ${{ secrets.E2E_STARTER_PASSWORD }}
+          E2E_PRO_PASSWORD: ${{ secrets.E2E_PRO_PASSWORD }}
+          E2E_BUSINESS_PASSWORD: ${{ secrets.E2E_BUSINESS_PASSWORD }}
+          E2E_FLEET_PASSWORD: ${{ secrets.E2E_FLEET_PASSWORD }}
+          E2E_ADMIN_PASSWORD: ${{ secrets.E2E_ADMIN_PASSWORD }}
+          CI: "true"
+        run: |
+          npx playwright test ${{ inputs.test_path }} \
+            --config=${{ inputs.config_path }} \
+            --shard=${{ matrix.shard }}/${{ inputs.shard_total }}
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ matrix.shard }}
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 14
+
+      - name: Upload trace on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-traces-${{ matrix.shard }}
+          path: test-results/**/trace.zip
+          retention-days: 7

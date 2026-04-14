@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    if: "!startsWith(github.event.head_commit.message, 'chore:')"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Release per-component
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Map component name → workflow file path
+          declare -A COMPONENTS=(
+            [go-ci]=".github/workflows/go-ci.yml"
+            [python-ci]=".github/workflows/python-ci.yml"
+            [frontend-ci]=".github/workflows/frontend-ci.yml"
+            [deploy]=".github/workflows/deploy.yml"
+            [security]=".github/workflows/security.yml"
+            [e2e-tests]=".github/workflows/e2e-tests.yml"
+          )
+
+          for COMPONENT in "${!COMPONENTS[@]}"; do
+            FILE="${COMPONENTS[$COMPONENT]}"
+
+            # Find latest semver tag for this component
+            LAST_TAG=$(git tag --sort=-v:refname | grep -E "^${COMPONENT}/v[0-9]+\.[0-9]+\.[0-9]+$" | head -1 || true)
+            if [ -z "$LAST_TAG" ]; then
+              RANGE="HEAD"
+              VERSION="0.0.0"
+            else
+              RANGE="${LAST_TAG}..HEAD"
+              VERSION=$(echo "$LAST_TAG" | sed "s|^${COMPONENT}/v||")
+            fi
+
+            # Get commits in range that touch this component's file
+            COMMITS=$(git log "$RANGE" --pretty=format:"%s" -- "$FILE" 2>/dev/null || true)
+            if [ -z "$COMMITS" ]; then
+              echo "[$COMPONENT] No commits touching $FILE since $LAST_TAG — skipping"
+              continue
+            fi
+
+            # Determine bump level
+            MAJOR=$(echo "$VERSION" | cut -d. -f1)
+            MINOR=$(echo "$VERSION" | cut -d. -f2)
+            PATCH=$(echo "$VERSION" | cut -d. -f3)
+
+            HAS_BREAKING=$(echo "$COMMITS" | grep -cE "^[a-z]+(\(.+\))?!:|BREAKING CHANGE" || true)
+            HAS_FEAT=$(echo "$COMMITS" | grep -cE "^feat" || true)
+            HAS_PATCH=$(echo "$COMMITS" | grep -cE "^(fix|refactor|perf|chore|ci|build|test)" || true)
+
+            if [ "$HAS_BREAKING" -gt 0 ]; then
+              MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0
+            elif [ "$HAS_FEAT" -gt 0 ]; then
+              MINOR=$((MINOR + 1)); PATCH=0
+            elif [ "$HAS_PATCH" -gt 0 ]; then
+              PATCH=$((PATCH + 1))
+            else
+              echo "[$COMPONENT] No conventional commits — skipping"
+              continue
+            fi
+
+            NEW_TAG="${COMPONENT}/v${MAJOR}.${MINOR}.${PATCH}"
+            FLOATING_TAG="${COMPONENT}/v${MAJOR}"
+
+            echo "[$COMPONENT] Bumping to $NEW_TAG"
+
+            # Generate changelog
+            BODY=""
+            FEATS=$(echo "$COMMITS" | grep -E "^feat" | sed 's/^feat[^:]*: //' | sed 's/^/- /' || true)
+            FIXES=$(echo "$COMMITS" | grep -E "^fix" | sed 's/^fix[^:]*: //' | sed 's/^/- /' || true)
+            OTHER=$(echo "$COMMITS" | grep -E "^(refactor|perf|chore|ci|build|test)" | sed 's/^[^:]*: //' | sed 's/^/- /' || true)
+
+            [ -n "$FEATS" ] && BODY="${BODY}## Features\n${FEATS}\n\n"
+            [ -n "$FIXES" ] && BODY="${BODY}## Bug Fixes\n${FIXES}\n\n"
+            [ -n "$OTHER" ] && BODY="${BODY}## Other Changes\n${OTHER}\n\n"
+
+            # Create GitHub release
+            echo -e "$BODY" | gh release create "$NEW_TAG" \
+              --title "$NEW_TAG" \
+              --notes-file - \
+              --target main
+
+            # Update floating major tag
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag -f "$FLOATING_TAG" HEAD
+            git push origin "$FLOATING_TAG" --force
+
+            echo "[$COMPONENT] Released $NEW_TAG (floating: $FLOATING_TAG)"
+          done
