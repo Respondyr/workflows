@@ -42,7 +42,7 @@ jobs:
           owner: Respondyr
 
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           token: ${{ steps.app-token.outputs.token }}
           ref: main
