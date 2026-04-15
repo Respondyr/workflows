@@ -123,15 +123,15 @@ jobs:
       - name: Create GitHub Release
         if: steps.bump.outputs.skip == 'false'
         run: |
-          cat <<'NOTES_EOF' > /tmp/release-notes.md
-          ${{ steps.changelog.outputs.body }}
-          NOTES_EOF
-          gh release create "${{ steps.bump.outputs.tag }}" \
-            --title "${{ steps.bump.outputs.tag }}" \
+          printf '%s\n' "$RELEASE_NOTES" > /tmp/release-notes.md
+          gh release create "$TAG" \
+            --title "$TAG" \
             --notes-file /tmp/release-notes.md \
             --target "${{ github.sha }}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.bump.outputs.tag }}
+          RELEASE_NOTES: ${{ steps.changelog.outputs.body }}
 
   # ──────────────────────────────────────────────
   # RETAG — same image, new tag (:sha → :vX.Y.Z)
