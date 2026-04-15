@@ -123,9 +123,12 @@ jobs:
       - name: Create GitHub Release
         if: steps.bump.outputs.skip == 'false'
         run: |
+          cat <<'NOTES_EOF' > /tmp/release-notes.md
+          ${{ steps.changelog.outputs.body }}
+          NOTES_EOF
           gh release create "${{ steps.bump.outputs.tag }}" \
             --title "${{ steps.bump.outputs.tag }}" \
-            --notes "${{ steps.changelog.outputs.body }}" \
+            --notes-file /tmp/release-notes.md \
             --target "${{ github.sha }}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
