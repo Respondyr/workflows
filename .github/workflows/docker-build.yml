@@ -1,7 +1,8 @@
 # docker-build.yml — Reusable Docker Build & Push to ECR
 #
-# Builds a multi-arch image (amd64 + arm64), pushes to ECR tagged with
-# the git SHA. Optionally tags as :latest via the tag_latest input.
+# Builds an arm64 image, pushes to ECR tagged with the git SHA.
+# Both clusters (dev MacBook M3, prod Mac Mini) are Apple Silicon —
+# no amd64 consumers. Uses GHA cache for Docker layer reuse.
 # Extracted from deploy.yml Phase 1 CI/CD restructure.
 
 name: Docker Build & Push
@@ -112,6 +113,8 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/arm64
           push: true
           tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
