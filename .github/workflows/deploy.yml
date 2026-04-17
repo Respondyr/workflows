@@ -1,6 +1,6 @@
 # deploy.yml — Unified main-merge pipeline
 #
-# Flow: test → build → deploy-dev → verify → release → retag → deploy-prod
+# Flow: test → build → deploy-dev → verify → release → retag → deploy-prod (GitOps)
 #
 # Convention over configuration:
 #   - Go:     go vet ./... → go test ./... → go build
@@ -556,73 +556,17 @@ jobs:
           echo "Tagged $TAG"
 
   # ──────────────────────────────────────────────
-  # 7. DEPLOY PROD — ArgoCD API: set semver tag → sync → verify
+  # 7. DEPLOY PROD — GitOps: update values-prod.yaml → ArgoCD polls
   # ──────────────────────────────────────────────
   deploy-prod:
-    name: Deploy to Prod
+    name: Deploy to Prod (GitOps)
     needs: [retag, release]
-    if: false  # Prod deploys are manual — Travis triggers via deploy-prod.yml in each repo
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    concurrency:
-      group: argocd-prod
-      cancel-in-progress: false
-    env:
-      ARGOCD_SERVER: argocd.respondyr.com
-    steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
-
-      - name: Fetch ArgoCD token
-        run: |
-          ARGOCD_AUTH_TOKEN=$(aws secretsmanager get-secret-value \
-            --secret-id prod/platform/master-list \
-            --query 'SecretString' --output text \
-            --region ${{ vars.AWS_REGION }} | jq -r '.["ARGOCD-PROD-TOKEN"]')
-          echo "::add-mask::$ARGOCD_AUTH_TOKEN"
-          echo "ARGOCD_AUTH_TOKEN=$ARGOCD_AUTH_TOKEN" >> "$GITHUB_ENV"
-
-      - name: Install ArgoCD CLI
-        run: |
-          curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
-          chmod +x argocd && sudo mv argocd /usr/local/bin/
-
-      - name: Set image tag and sync
-        run: |
-          TAG="${{ needs.release.outputs.tag }}"
-          argocd app set "${{ inputs.service_name }}" \
-            -p "base-service.deployment.image.tag=$TAG" \
-            --grpc-web --insecure
-
-          # Retry sync up to 5 times with backoff to handle "another operation in progress"
-          for attempt in 1 2 3 4 5; do
-            if argocd app sync "${{ inputs.service_name }}" --grpc-web --insecure --prune 2>&1; then
-              echo "Sync started on attempt $attempt"
-              break
-            fi
-            if [ "$attempt" -eq 5 ]; then
-              echo "::error::Sync failed after 5 attempts"
-              exit 1
-            fi
-            BACKOFF=$((attempt * 10))
-            echo "Sync attempt $attempt failed, retrying in ${BACKOFF}s..."
-            sleep "$BACKOFF"
-          done
-
-          argocd app wait "${{ inputs.service_name }}" --health --sync --timeout 300 --grpc-web --insecure
-
-      - name: Verify deployment health
-        run: |
-          HEALTH=$(argocd app get "${{ inputs.service_name }}" -o json --grpc-web --insecure | jq -r '.status.health.status')
-          if [ "$HEALTH" != "Healthy" ]; then
-            echo "::error::Prod deployment unhealthy: $HEALTH"
-            argocd app get "${{ inputs.service_name }}" --grpc-web --insecure
-            exit 1
-          fi
-          echo "Prod deployment healthy"
+    if: ${{ !cancelled() && !failure() && needs.release.outputs.skip == 'false' && needs.retag.result == 'success' }}
+    uses: Respondyr/workflows/.github/workflows/deploy-prod-gitops.yml@main
+    with:
+      version: ${{ needs.release.outputs.tag }}
+      service_name: ${{ inputs.service_name }}
+    secrets: inherit
 
   # ──────────────────────────────────────────────
   # 8. NOTIFY — Discord alert on any job failure
