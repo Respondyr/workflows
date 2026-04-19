@@ -316,14 +316,25 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Fetch ArgoCD token
+      - name: Fetch ArgoCD token and CF Access headers
         run: |
-          ARGOCD_AUTH_TOKEN=$(aws secretsmanager get-secret-value \
+          SECRET=$(aws secretsmanager get-secret-value \
             --secret-id dev/platform/master-list \
             --query 'SecretString' --output text \
-            --region ${{ vars.AWS_REGION }} | jq -r '.["ARGOCD-DEV-TOKEN"]')
+            --region ${{ vars.AWS_REGION }})
+          ARGOCD_AUTH_TOKEN=$(echo "$SECRET" | jq -r '.["ARGOCD-DEV-TOKEN"]')
+          CF_CLIENT_ID=$(echo "$SECRET" | jq -r '.["CF-ACCESS-CLIENT-ID"]')
+          CF_CLIENT_SECRET=$(echo "$SECRET" | jq -r '.["CF-ACCESS-CLIENT-SECRET"]')
           echo "::add-mask::$ARGOCD_AUTH_TOKEN"
-          echo "ARGOCD_AUTH_TOKEN=$ARGOCD_AUTH_TOKEN" >> "$GITHUB_ENV"
+          echo "::add-mask::$CF_CLIENT_ID"
+          echo "::add-mask::$CF_CLIENT_SECRET"
+          {
+            echo "ARGOCD_AUTH_TOKEN=$ARGOCD_AUTH_TOKEN"
+            # ARGOCD_HTTP_HEADERS: argocd CLI appends these to every request.
+            # Lets CI bypass the Cloudflare Access policy on argocd-dev via a
+            # service-token principal (non_identity policy in terraform/cloudflare/access.tf).
+            echo "ARGOCD_HTTP_HEADERS=CF-Access-Client-Id: $CF_CLIENT_ID, CF-Access-Client-Secret: $CF_CLIENT_SECRET"
+          } >> "$GITHUB_ENV"
 
       - name: Install ArgoCD CLI
         run: |
@@ -332,9 +343,22 @@ jobs:
 
       - name: Set image tag and sync
         run: |
-          argocd app set "${{ inputs.service_name }}" \
-            -p "base-service.deployment.image.tag=${{ github.sha }}" \
-            --grpc-web --insecure
+          # Retry `app set` — Cloudflare tunnel occasionally EOFs long-lived grpc-web streams.
+          for attempt in 1 2 3 4 5; do
+            if argocd app set "${{ inputs.service_name }}" \
+                 -p "base-service.deployment.image.tag=${{ github.sha }}" \
+                 --grpc-web --insecure 2>&1; then
+              echo "app set succeeded on attempt $attempt"
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "::error::app set failed after 5 attempts"
+              exit 1
+            fi
+            BACKOFF=$((attempt * 10))
+            echo "app set attempt $attempt failed (tunnel flake), retrying in ${BACKOFF}s..."
+            sleep "$BACKOFF"
+          done
 
           # Retry sync up to 5 times with backoff to handle "another operation in progress"
           for attempt in 1 2 3 4 5; do
