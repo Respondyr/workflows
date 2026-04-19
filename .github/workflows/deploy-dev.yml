@@ -52,59 +52,105 @@ jobs:
           echo "::add-mask::$CF_CLIENT_SECRET"
           {
             echo "ARGOCD_AUTH_TOKEN=$ARGOCD_AUTH_TOKEN"
-            # ARGOCD_HTTP_HEADERS: comma-separated list of HTTP headers that argocd
-            # CLI appends to every request. Lets CI bypass the Cloudflare Access
-            # policy on argocd-dev.respondyr.com via a service-token principal.
-            echo "ARGOCD_HTTP_HEADERS=CF-Access-Client-Id: $CF_CLIENT_ID, CF-Access-Client-Secret: $CF_CLIENT_SECRET"
+            # CF Access service-token headers — attached to every REST call
+            # to bypass the non_identity policy on argocd-dev.respondyr.com.
+            echo "CF_CLIENT_ID=$CF_CLIENT_ID"
+            echo "CF_CLIENT_SECRET=$CF_CLIENT_SECRET"
           } >> "$GITHUB_ENV"
 
-      - name: Install ArgoCD CLI
+      - name: Set image tag, sync, and verify (REST)
+        env:
+          SVC: ${{ inputs.service_name }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
-          curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
-          chmod +x argocd && sudo mv argocd /usr/local/bin/
+          # REST-over-curl instead of `argocd` CLI + grpc-web: the cloudflared
+          # tunnel on the Mini consistently EOFs grpc-web streams, but plain
+          # HTTP/1.1 works. Short-lived requests, no long streams, no CLI.
+          set -euo pipefail
+          BASE="https://${ARGOCD_SERVER}/api/v1"
 
-      - name: Set image tag and sync
-        run: |
-          # Retry `app set` — Cloudflare tunnel EOFs on long-lived grpc-web streams.
-          for attempt in 1 2 3 4 5; do
-            if argocd app set "${{ inputs.service_name }}" \
-                 -p "base-service.deployment.image.tag=${{ inputs.image_tag }}" \
-                 --grpc-web --insecure 2>&1; then
-              echo "app set succeeded on attempt $attempt"
-              break
-            fi
-            if [ "$attempt" -eq 5 ]; then
-              echo "::error::app set failed after 5 attempts"
-              exit 1
-            fi
-            BACKOFF=$((attempt * 10))
-            echo "app set attempt $attempt failed (tunnel flake), retrying in ${BACKOFF}s..."
-            sleep "$BACKOFF"
-          done
+          call() {
+            local method="$1" path="$2" body="${3-}" resp code data attempt
+            for attempt in 1 2 3 4 5; do
+              if [ -n "$body" ]; then
+                resp=$(curl -sS --http1.1 --max-time 30 -w '\n%{http_code}' -X "$method" \
+                  -H "Authorization: Bearer ${ARGOCD_AUTH_TOKEN}" \
+                  -H "CF-Access-Client-Id: ${CF_CLIENT_ID}" \
+                  -H "CF-Access-Client-Secret: ${CF_CLIENT_SECRET}" \
+                  -H "Content-Type: application/json" \
+                  --data "$body" "${BASE}${path}") || { echo "attempt $attempt: curl error" >&2; sleep $((attempt*5)); continue; }
+              else
+                resp=$(curl -sS --http1.1 --max-time 30 -w '\n%{http_code}' -X "$method" \
+                  -H "Authorization: Bearer ${ARGOCD_AUTH_TOKEN}" \
+                  -H "CF-Access-Client-Id: ${CF_CLIENT_ID}" \
+                  -H "CF-Access-Client-Secret: ${CF_CLIENT_SECRET}" \
+                  "${BASE}${path}") || { echo "attempt $attempt: curl error" >&2; sleep $((attempt*5)); continue; }
+              fi
+              code=$(printf '%s' "$resp" | tail -n1)
+              data=$(printf '%s' "$resp" | sed '$d')
+              if [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
+                printf '%s' "$data"
+                return 0
+              fi
+              echo "attempt $attempt: HTTP $code" >&2
+              [ "$attempt" -eq 5 ] || sleep $((attempt*5))
+            done
+            echo "::error::$method $path failed after 5 attempts" >&2
+            return 1
+          }
 
-          # Retry sync up to 5 times with backoff to handle "another operation in progress"
-          for attempt in 1 2 3 4 5; do
-            if argocd app sync "${{ inputs.service_name }}" --grpc-web --insecure --prune 2>&1; then
-              echo "Sync started on attempt $attempt"
-              break
-            fi
-            if [ "$attempt" -eq 5 ]; then
-              echo "::error::Sync failed after 5 attempts"
-              exit 1
-            fi
-            BACKOFF=$((attempt * 10))
-            echo "Sync attempt $attempt failed, retrying in ${BACKOFF}s..."
-            sleep "$BACKOFF"
-          done
+          echo "→ fetch current app spec"
+          APP=$(call GET "/applications/${SVC}")
 
-          argocd app wait "${{ inputs.service_name }}" --health --sync --timeout 300 --grpc-web --insecure
+          echo "→ build updated spec with image tag ${IMAGE_TAG}"
+          NEW_SPEC=$(printf '%s' "$APP" | jq --arg tag "$IMAGE_TAG" '
+            .spec
+            | .source.helm.parameters = (
+                (.source.helm.parameters // [])
+                | map(select(.name != "base-service.deployment.image.tag"))
+                + [{name: "base-service.deployment.image.tag", value: $tag}]
+              )
+          ')
 
-      - name: Verify deployment health
-        run: |
-          HEALTH=$(argocd app get "${{ inputs.service_name }}" -o json --grpc-web --insecure | jq -r '.status.health.status')
-          if [ "$HEALTH" != "Healthy" ]; then
-            echo "::error::Dev deployment unhealthy: $HEALTH"
-            argocd app get "${{ inputs.service_name }}" --grpc-web --insecure
+          echo "→ PUT updated spec"
+          call PUT "/applications/${SVC}/spec?validate=true" "$NEW_SPEC" >/dev/null
+
+          echo "→ trigger sync"
+          SYNC_RESP=$(curl -sS --http1.1 --max-time 30 -w '\n%{http_code}' -X POST \
+            -H "Authorization: Bearer ${ARGOCD_AUTH_TOKEN}" \
+            -H "CF-Access-Client-Id: ${CF_CLIENT_ID}" \
+            -H "CF-Access-Client-Secret: ${CF_CLIENT_SECRET}" \
+            -H "Content-Type: application/json" \
+            --data '{"prune":true}' "${BASE}/applications/${SVC}/sync" || true)
+          SYNC_CODE=$(printf '%s' "$SYNC_RESP" | tail -n1)
+          SYNC_DATA=$(printf '%s' "$SYNC_RESP" | sed '$d')
+          if [ "${SYNC_CODE:-0}" -ge 200 ] && [ "${SYNC_CODE:-0}" -lt 300 ]; then
+            echo "sync triggered"
+          elif printf '%s' "$SYNC_DATA" | grep -qi "another operation is already in progress"; then
+            echo "sync already in progress — proceeding to wait"
+          else
+            echo "::error::sync failed: HTTP ${SYNC_CODE:-?} ${SYNC_DATA}"
             exit 1
           fi
-          echo "Dev deployment healthy"
+
+          echo "→ poll for Healthy + Synced (300s timeout)"
+          deadline=$(( $(date +%s) + 300 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            STATUS=$(call GET "/applications/${SVC}" || echo '{}')
+            HEALTH=$(printf '%s' "$STATUS" | jq -r '.status.health.status // "Unknown"')
+            SYNC=$(printf '%s' "$STATUS" | jq -r '.status.sync.status // "Unknown"')
+            OPERATION=$(printf '%s' "$STATUS" | jq -r '.status.operationState.phase // ""')
+            echo "  health=${HEALTH} sync=${SYNC} op=${OPERATION}"
+            if [ "$HEALTH" = "Healthy" ] && [ "$SYNC" = "Synced" ] && { [ -z "$OPERATION" ] || [ "$OPERATION" = "Succeeded" ]; }; then
+              echo "dev deploy healthy and synced"
+              exit 0
+            fi
+            if [ "$OPERATION" = "Failed" ] || [ "$OPERATION" = "Error" ]; then
+              echo "::error::sync operation $OPERATION"
+              printf '%s' "$STATUS" | jq '.status.operationState.message // empty'
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "::error::deploy did not reach Healthy+Synced within 300s"
+          exit 1
