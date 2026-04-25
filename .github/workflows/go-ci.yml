@@ -83,6 +83,21 @@ jobs:
       - name: Build
         run: go build -o /dev/null ${{ inputs.build_target }}
 
+      - name: Secret scan (gitleaks)
+        # Catches accidentally-committed credentials (.env, keys, tokens). Uses
+        # the shared allowlist at github.com/Respondyr/workflows/.gitleaks.toml
+        # which excludes obvious test fixtures (test_secret, *.example, etc.).
+        # P0.3 Sub-track 4.3 — prevention against re-introducing the secrets
+        # we already rotated.
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          config-path: .gitleaks.toml
+          # `with: config-path:` is read by gitleaks-action only when present at
+          # the calling repo root. If the calling repo has no .gitleaks.toml,
+          # gitleaks falls back to its built-in default ruleset, which is fine.
+
       - name: Lint raw AMQP calls
         if: inputs.lint_raw_amqp
         run: |

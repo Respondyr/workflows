@@ -39,6 +39,17 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Secret scan (gitleaks)
+        # Catches accidentally-committed credentials (.env, keys, tokens).
+        # Falls back to gitleaks' built-in ruleset if the calling repo has no
+        # .gitleaks.toml. P0.3 Sub-track 4.3 — prevention against
+        # re-introducing the secrets we already rotated.
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          config-path: .gitleaks.toml
+
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
