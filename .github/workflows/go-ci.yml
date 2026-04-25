@@ -84,19 +84,31 @@ jobs:
         run: go build -o /dev/null ${{ inputs.build_target }}
 
       - name: Secret scan (gitleaks)
-        # Catches accidentally-committed credentials (.env, keys, tokens). Uses
-        # the shared allowlist at github.com/Respondyr/workflows/.gitleaks.toml
-        # which excludes obvious test fixtures (test_secret, *.example, etc.).
+        # Catches accidentally-committed credentials (.env, keys, tokens).
         # P0.3 Sub-track 4.3 — prevention against re-introducing the secrets
         # we already rotated.
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          config-path: .gitleaks.toml
-          # `with: config-path:` is read by gitleaks-action only when present at
-          # the calling repo root. If the calling repo has no .gitleaks.toml,
-          # gitleaks falls back to its built-in default ruleset, which is fine.
+        #
+        # We call the gitleaks CLI directly rather than `gitleaks/gitleaks-action`
+        # because gitleaks-action@v2 requires a paid license for GitHub orgs
+        # ("Respondyr is an organization. License key is required."). The CLI is
+        # MIT-licensed and free for any use; the action wrapper is the only
+        # licensed piece. Same scan, no subscription dependency.
+        #
+        # Uses each calling repo's `.gitleaks.toml` if present, otherwise falls
+        # back to gitleaks' built-in default ruleset. `--no-banner` keeps the
+        # log clean; non-zero exit on findings fails the job.
+        run: |
+          set -euo pipefail
+          GITLEAKS_VERSION=8.21.2
+          curl -sSL -o /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          chmod +x /tmp/gitleaks
+          if [ -f .gitleaks.toml ]; then
+            /tmp/gitleaks dir --config .gitleaks.toml --no-banner --redact .
+          else
+            /tmp/gitleaks dir --no-banner --redact .
+          fi
 
       - name: Lint raw AMQP calls
         if: inputs.lint_raw_amqp
