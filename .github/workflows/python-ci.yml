@@ -55,8 +55,18 @@ jobs:
             "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
           tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
           chmod +x /tmp/gitleaks
+          # Repo-local .gitleaks.toml takes precedence; otherwise auto-fetch
+          # the canonical workflows-repo allowlist.
           if [ -f .gitleaks.toml ]; then
-            /tmp/gitleaks dir --config .gitleaks.toml --no-banner --redact .
+            CONFIG=.gitleaks.toml
+          else
+            curl -sSL -o /tmp/.gitleaks.toml \
+              "https://raw.githubusercontent.com/Respondyr/workflows/main/.gitleaks.toml" \
+              || { echo "warn: failed to fetch shared .gitleaks.toml; falling back to built-in rules"; CONFIG=""; }
+            [ -f /tmp/.gitleaks.toml ] && CONFIG=/tmp/.gitleaks.toml || CONFIG=""
+          fi
+          if [ -n "$CONFIG" ]; then
+            /tmp/gitleaks dir --config "$CONFIG" --no-banner --redact .
           else
             /tmp/gitleaks dir --no-banner --redact .
           fi
