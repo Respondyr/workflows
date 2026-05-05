@@ -1,16 +1,25 @@
-# deploy-dev.yml — Reusable Deploy to Dev via ArgoCD API
+# deploy-dev.yml — Reusable GitOps Deploy to Dev
 #
-# Sets image tag, syncs with retries + backoff, waits for health.
-# Global concurrency lock — ArgoCD dev can't handle concurrent syncs.
-# Extracted from deploy.yml Phase 1 CI/CD restructure.
+# Updates the dev Helm values file with the target image tag, commits
+# directly to main using a GitHub App token (bypasses branch protection),
+# and notifies Discord on success or failure. ArgoCD picks up the change
+# via GitOps polling/webhook — no ArgoCD API calls.
+#
+# Phase 2 of the dev image-tag durability fix: the previous workflow
+# PATCHed ArgoCD's `spec.source.helm.parameters` so the tag lived only
+# in cluster state (etcd). The 2026-05-05 colima nuke wiped etcd and
+# every dev pod fell back to whatever tag was in helm/values-dev.yaml
+# in git — and ECR retention had GC'd those SHAs, so the cluster sat
+# in ImagePullBackOff until tags were manually re-applied. Persisting
+# the tag in git makes dev recoverable from a cold-start by design.
 
-name: Deploy to Dev
+name: Deploy to Dev (gitops)
 
 on:
   workflow_call:
     inputs:
       service_name:
-        description: "ArgoCD app name"
+        description: "Service name (also the ArgoCD app name)"
         required: true
         type: string
       image_tag:
@@ -19,138 +28,111 @@ on:
         type: string
 
 permissions:
-  id-token: write
+  contents: write
+
+# Per-service serialization. Replaces the old global `argocd-dev` lock
+# (which was needed because every dev deploy hit the same ArgoCD app's
+# spec). Two services bumping their own values files don't conflict.
+concurrency:
+  group: deploy-dev-${{ inputs.service_name }}
+  cancel-in-progress: false
 
 jobs:
   deploy:
-    name: Deploy to Dev
+    name: Deploy to Dev (gitops)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    concurrency:
-      group: argocd-dev
-      cancel-in-progress: false
-    env:
-      ARGOCD_SERVER: argocd-dev.respondyr.com
+    timeout-minutes: 5
     steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: Respondyr
 
-      - name: Fetch ArgoCD token and CF Access headers
+      - name: Checkout repo
+        uses: actions/checkout@v6
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          ref: main
+          # Full history so `git pull --rebase` works on retry.
+          fetch-depth: 0
+
+      - name: Install yq
         run: |
-          SECRET=$(aws secretsmanager get-secret-value \
-            --secret-id dev/platform/master-list \
-            --query 'SecretString' --output text \
-            --region ${{ vars.AWS_REGION }})
-          ARGOCD_AUTH_TOKEN=$(echo "$SECRET" | jq -r '.["ARGOCD-DEV-TOKEN"]')
-          CF_CLIENT_ID=$(echo "$SECRET" | jq -r '.["CF-ACCESS-CLIENT-ID"]')
-          CF_CLIENT_SECRET=$(echo "$SECRET" | jq -r '.["CF-ACCESS-CLIENT-SECRET"]')
-          echo "::add-mask::$ARGOCD_AUTH_TOKEN"
-          echo "::add-mask::$CF_CLIENT_ID"
-          echo "::add-mask::$CF_CLIENT_SECRET"
-          {
-            echo "ARGOCD_AUTH_TOKEN=$ARGOCD_AUTH_TOKEN"
-            # CF Access service-token headers — attached to every REST call
-            # to bypass the non_identity policy on argocd-dev.respondyr.com.
-            echo "CF_CLIENT_ID=$CF_CLIENT_ID"
-            echo "CF_CLIENT_SECRET=$CF_CLIENT_SECRET"
-          } >> "$GITHUB_ENV"
+          wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 && chmod +x /usr/local/bin/yq
 
-      - name: Set image tag, sync, and verify (REST)
-        env:
-          SVC: ${{ inputs.service_name }}
-          IMAGE_TAG: ${{ inputs.image_tag }}
+      - name: Sanity-check values file structure
         run: |
-          # REST-over-curl instead of `argocd` CLI + grpc-web: the cloudflared
-          # tunnel on the Mini consistently EOFs grpc-web streams, but plain
-          # HTTP/1.1 works. Short-lived requests, no long streams, no CLI.
-          set -euo pipefail
-          BASE="https://${ARGOCD_SERVER}/api/v1"
-
-          call() {
-            local method="$1" path="$2" body="${3-}" resp code data attempt
-            for attempt in 1 2 3 4 5; do
-              if [ -n "$body" ]; then
-                resp=$(curl -sS --http1.1 --max-time 30 -w '\n%{http_code}' -X "$method" \
-                  -H "Authorization: Bearer ${ARGOCD_AUTH_TOKEN}" \
-                  -H "CF-Access-Client-Id: ${CF_CLIENT_ID}" \
-                  -H "CF-Access-Client-Secret: ${CF_CLIENT_SECRET}" \
-                  -H "Content-Type: application/json" \
-                  --data "$body" "${BASE}${path}") || { echo "attempt $attempt: curl error" >&2; sleep $((attempt*5)); continue; }
-              else
-                resp=$(curl -sS --http1.1 --max-time 30 -w '\n%{http_code}' -X "$method" \
-                  -H "Authorization: Bearer ${ARGOCD_AUTH_TOKEN}" \
-                  -H "CF-Access-Client-Id: ${CF_CLIENT_ID}" \
-                  -H "CF-Access-Client-Secret: ${CF_CLIENT_SECRET}" \
-                  "${BASE}${path}") || { echo "attempt $attempt: curl error" >&2; sleep $((attempt*5)); continue; }
-              fi
-              code=$(printf '%s' "$resp" | tail -n1)
-              data=$(printf '%s' "$resp" | sed '$d')
-              if [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
-                printf '%s' "$data"
-                return 0
-              fi
-              echo "attempt $attempt: HTTP $code" >&2
-              [ "$attempt" -eq 5 ] || sleep $((attempt*5))
-            done
-            echo "::error::$method $path failed after 5 attempts" >&2
-            return 1
-          }
-
-          echo "→ fetch current app spec"
-          APP=$(call GET "/applications/${SVC}")
-
-          echo "→ build updated spec with image tag ${IMAGE_TAG}"
-          NEW_SPEC=$(printf '%s' "$APP" | jq --arg tag "$IMAGE_TAG" '
-            .spec
-            | .source.helm.parameters = (
-                (.source.helm.parameters // [])
-                | map(select(.name != "base-service.deployment.image.tag"))
-                + [{name: "base-service.deployment.image.tag", value: $tag}]
-              )
-          ')
-
-          echo "→ PUT updated spec"
-          call PUT "/applications/${SVC}/spec?validate=true" "$NEW_SPEC" >/dev/null
-
-          echo "→ trigger sync"
-          SYNC_RESP=$(curl -sS --http1.1 --max-time 30 -w '\n%{http_code}' -X POST \
-            -H "Authorization: Bearer ${ARGOCD_AUTH_TOKEN}" \
-            -H "CF-Access-Client-Id: ${CF_CLIENT_ID}" \
-            -H "CF-Access-Client-Secret: ${CF_CLIENT_SECRET}" \
-            -H "Content-Type: application/json" \
-            --data '{"prune":true}' "${BASE}/applications/${SVC}/sync" || true)
-          SYNC_CODE=$(printf '%s' "$SYNC_RESP" | tail -n1)
-          SYNC_DATA=$(printf '%s' "$SYNC_RESP" | sed '$d')
-          if [ "${SYNC_CODE:-0}" -ge 200 ] && [ "${SYNC_CODE:-0}" -lt 300 ]; then
-            echo "sync triggered"
-          elif printf '%s' "$SYNC_DATA" | grep -qi "another operation is already in progress"; then
-            echo "sync already in progress — proceeding to wait"
-          else
-            echo "::error::sync failed: HTTP ${SYNC_CODE:-?} ${SYNC_DATA}"
+          # `yq -i` will silently materialize missing parents, leaving the
+          # file structurally wrong but with our new tag inside. Fail loudly
+          # if `base-service.deployment` isn't already present.
+          if ! yq e '.base-service.deployment // ""' helm/values-dev.yaml | grep -q .; then
+            echo "::error::helm/values-dev.yaml is missing the .base-service.deployment block — refusing to bump"
             exit 1
           fi
 
-          echo "→ poll for Healthy + Synced (300s timeout)"
-          deadline=$(( $(date +%s) + 300 ))
-          while [ "$(date +%s)" -lt "$deadline" ]; do
-            STATUS=$(call GET "/applications/${SVC}" || echo '{}')
-            HEALTH=$(printf '%s' "$STATUS" | jq -r '.status.health.status // "Unknown"')
-            SYNC=$(printf '%s' "$STATUS" | jq -r '.status.sync.status // "Unknown"')
-            OPERATION=$(printf '%s' "$STATUS" | jq -r '.status.operationState.phase // ""')
-            echo "  health=${HEALTH} sync=${SYNC} op=${OPERATION}"
-            if [ "$HEALTH" = "Healthy" ] && [ "$SYNC" = "Synced" ] && { [ -z "$OPERATION" ] || [ "$OPERATION" = "Succeeded" ]; }; then
-              echo "dev deploy healthy and synced"
-              exit 0
+      - name: Read current tag
+        id: current
+        run: |
+          CURRENT_TAG=$(yq '.base-service.deployment.image.tag // ""' helm/values-dev.yaml)
+          echo "tag=$CURRENT_TAG" >> "$GITHUB_OUTPUT"
+          echo "Current tag: $CURRENT_TAG"
+
+      - name: Skip if already at requested tag
+        if: steps.current.outputs.tag == inputs.image_tag
+        run: |
+          echo "::notice::Dev already at ${{ inputs.image_tag }} — skipping bump"
+          exit 0
+
+      - name: Update image tag
+        if: steps.current.outputs.tag != inputs.image_tag
+        run: |
+          export VERSION="${{ inputs.image_tag }}"
+          yq -i '.base-service.deployment.image.tag = strenv(VERSION)' helm/values-dev.yaml
+          echo "Updated tag to $VERSION"
+          git diff helm/values-dev.yaml | head -20
+
+      - name: Commit and push (with rebase retry)
+        if: steps.current.outputs.tag != inputs.image_tag
+        run: |
+          # `[skip ci]` is critical: without it the bump push retriggers
+          # the service repo's CI on main. `pr.yml` paths-ignore protects
+          # PR-trigger-on-main, but `release.yml` may not — belt-and-
+          # suspenders.
+          set -euo pipefail
+          export VERSION="${{ inputs.image_tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add helm/values-dev.yaml
+          git commit -m "deploy: bump dev image tag for ${{ inputs.service_name }} to ${VERSION} [skip ci]"
+          for attempt in 1 2 3; do
+            if git pull --rebase origin main; then
+              if git push origin main; then
+                echo "pushed on attempt $attempt"
+                exit 0
+              fi
             fi
-            if [ "$OPERATION" = "Failed" ] || [ "$OPERATION" = "Error" ]; then
-              echo "::error::sync operation $OPERATION"
-              printf '%s' "$STATUS" | jq '.status.operationState.message // empty'
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::push failed after 3 attempts"
               exit 1
             fi
-            sleep 10
+            sleep $((attempt * 5))
           done
-          echo "::error::deploy did not reach Healthy+Synced within 300s"
-          exit 1
+
+      - name: Notify Discord — success
+        if: success() && steps.current.outputs.tag != inputs.image_tag
+        run: |
+          curl -s -H "Content-Type: application/json" \
+            -X POST \
+            -d "{\"embeds\":[{\"title\":\"Dev Deploy Succeeded\",\"description\":\"**Service:** ${{ inputs.service_name }}\n**Tag:** ${{ inputs.image_tag }}\n**Actor:** ${{ github.actor }}\n**Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\",\"color\":3066993}]}" \
+            "${{ secrets.DISCORD_DEPLOY_WEBHOOK }}"
+
+      - name: Notify Discord — failure
+        if: failure()
+        run: |
+          curl -s -H "Content-Type: application/json" \
+            -X POST \
+            -d "{\"embeds\":[{\"title\":\"Dev Deploy Failed\",\"description\":\"**Service:** ${{ inputs.service_name }}\n**Tag:** ${{ inputs.image_tag }}\n**Actor:** ${{ github.actor }}\n**Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\",\"color\":16711680}]}" \
+            "${{ secrets.DISCORD_DEPLOY_WEBHOOK }}"
