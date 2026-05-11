@@ -296,154 +296,31 @@ jobs:
           cache-to: type=gha,mode=max
 
   # ──────────────────────────────────────────────
-  # 3. DEPLOY DEV — ArgoCD API: set tag → sync → verify
+  # 3. DEPLOY DEV — GitOps: bump helm/values-dev.yaml in git → ArgoCD polls
+  #
+  # Delegates to the standalone `deploy-dev.yml` reusable workflow, the
+  # same one called from each service's `pr.yml`. That workflow commits
+  # the new image tag into helm/values-dev.yaml via a GitHub App token;
+  # ArgoCD on the dev Mini reconciles from git and rolls the pod.
+  #
+  # The previous inline implementation drove ArgoCD's REST API directly
+  # (PATCH /applications/<svc>/spec via cloudflared tunnel + CF Access
+  # service tokens), which failed every release with HTTP 401 once the
+  # ARGOCD-DEV-TOKEN / CF-Access creds drifted from `dev/platform/master-list`
+  # in AWS Secrets Manager. The git-commit path has no such token surface
+  # and was already proven on the PR pipeline (pr.yml → deploy-dev.yml).
   # ──────────────────────────────────────────────
   deploy-dev:
-    name: Deploy to Dev
+    name: Deploy to Dev (gitops)
     needs: docker
     if: ${{ always() && !failure() && !cancelled() && inputs.has_docker && inputs.argocd_enabled }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    concurrency:
-      group: argocd-dev
-      cancel-in-progress: false
-    env:
-      ARGOCD_SERVER: argocd-dev.respondyr.com
-    steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
-
-      - name: Fetch ArgoCD token and CF Access headers
-        run: |
-          SECRET=$(aws secretsmanager get-secret-value \
-            --secret-id dev/platform/master-list \
-            --query 'SecretString' --output text \
-            --region ${{ vars.AWS_REGION }})
-          ARGOCD_AUTH_TOKEN=$(echo "$SECRET" | jq -r '.["ARGOCD-DEV-TOKEN"]')
-          CF_CLIENT_ID=$(echo "$SECRET" | jq -r '.["CF-ACCESS-CLIENT-ID"]')
-          CF_CLIENT_SECRET=$(echo "$SECRET" | jq -r '.["CF-ACCESS-CLIENT-SECRET"]')
-          echo "::add-mask::$ARGOCD_AUTH_TOKEN"
-          echo "::add-mask::$CF_CLIENT_ID"
-          echo "::add-mask::$CF_CLIENT_SECRET"
-          {
-            echo "ARGOCD_AUTH_TOKEN=$ARGOCD_AUTH_TOKEN"
-            # CF Access service-token headers — attached to every REST call
-            # to bypass the non_identity policy on argocd-dev.respondyr.com
-            # (see infra/terraform/cloudflare/access.tf).
-            echo "CF_CLIENT_ID=$CF_CLIENT_ID"
-            echo "CF_CLIENT_SECRET=$CF_CLIENT_SECRET"
-          } >> "$GITHUB_ENV"
-
-      - name: Set image tag, sync, and verify (REST)
-        env:
-          SVC: ${{ inputs.service_name }}
-          IMAGE_TAG: ${{ github.sha }}
-        run: |
-          # Why REST + curl instead of `argocd` CLI + grpc-web:
-          # The cloudflared tunnel on the Mini (data-layer docker-compose, single
-          # QUIC connector) consistently EOFs grpc-web streams from GitHub runners
-          # — every attempt fails in <1s, retries don't help. Plain HTTP/1.1 REST
-          # through the same tunnel works fine (verified with curl against
-          # /api/version). So CI drops the CLI entirely and drives the ArgoCD
-          # REST API directly. Short-lived requests, no streams, no CLI install.
-          set -euo pipefail
-          BASE="https://${ARGOCD_SERVER}/api/v1"
-
-          # call METHOD PATH [BODY] — idempotent retry with exponential backoff.
-          # Use for GET/PUT only (POST /sync is handled inline because a dropped
-          # response still commits server-side and naive retries then fail with
-          # "another operation in progress").
-          call() {
-            local method="$1" path="$2" body="${3-}" resp code data attempt
-            for attempt in 1 2 3 4 5; do
-              if [ -n "$body" ]; then
-                resp=$(curl -sS --http1.1 --max-time 30 -w '\n%{http_code}' -X "$method" \
-                  -H "Authorization: Bearer ${ARGOCD_AUTH_TOKEN}" \
-                  -H "CF-Access-Client-Id: ${CF_CLIENT_ID}" \
-                  -H "CF-Access-Client-Secret: ${CF_CLIENT_SECRET}" \
-                  -H "Content-Type: application/json" \
-                  --data "$body" "${BASE}${path}") || { echo "attempt $attempt: curl error" >&2; sleep $((attempt*5)); continue; }
-              else
-                resp=$(curl -sS --http1.1 --max-time 30 -w '\n%{http_code}' -X "$method" \
-                  -H "Authorization: Bearer ${ARGOCD_AUTH_TOKEN}" \
-                  -H "CF-Access-Client-Id: ${CF_CLIENT_ID}" \
-                  -H "CF-Access-Client-Secret: ${CF_CLIENT_SECRET}" \
-                  "${BASE}${path}") || { echo "attempt $attempt: curl error" >&2; sleep $((attempt*5)); continue; }
-              fi
-              code=$(printf '%s' "$resp" | tail -n1)
-              data=$(printf '%s' "$resp" | sed '$d')
-              if [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
-                printf '%s' "$data"
-                return 0
-              fi
-              echo "attempt $attempt: HTTP $code" >&2
-              [ "$attempt" -eq 5 ] || sleep $((attempt*5))
-            done
-            echo "::error::$method $path failed after 5 attempts" >&2
-            return 1
-          }
-
-          echo "→ fetch current app spec"
-          APP=$(call GET "/applications/${SVC}")
-
-          echo "→ build updated spec with image tag ${IMAGE_TAG}"
-          NEW_SPEC=$(printf '%s' "$APP" | jq --arg tag "$IMAGE_TAG" '
-            .spec
-            | .source.helm.parameters = (
-                (.source.helm.parameters // [])
-                | map(select(.name != "base-service.deployment.image.tag"))
-                + [{name: "base-service.deployment.image.tag", value: $tag}]
-              )
-          ')
-
-          echo "→ PUT updated spec"
-          call PUT "/applications/${SVC}/spec?validate=true" "$NEW_SPEC" >/dev/null
-          echo "image tag set"
-
-          echo "→ trigger sync"
-          # Inline (no retry helper): a dropped response commits server-side.
-          SYNC_BODY='{"prune":true}'
-          SYNC_RESP=$(curl -sS --http1.1 --max-time 30 -w '\n%{http_code}' -X POST \
-            -H "Authorization: Bearer ${ARGOCD_AUTH_TOKEN}" \
-            -H "CF-Access-Client-Id: ${CF_CLIENT_ID}" \
-            -H "CF-Access-Client-Secret: ${CF_CLIENT_SECRET}" \
-            -H "Content-Type: application/json" \
-            --data "$SYNC_BODY" "${BASE}/applications/${SVC}/sync" || true)
-          SYNC_CODE=$(printf '%s' "$SYNC_RESP" | tail -n1)
-          SYNC_DATA=$(printf '%s' "$SYNC_RESP" | sed '$d')
-          if [ "${SYNC_CODE:-0}" -ge 200 ] && [ "${SYNC_CODE:-0}" -lt 300 ]; then
-            echo "sync triggered"
-          elif printf '%s' "$SYNC_DATA" | grep -qi "another operation is already in progress"; then
-            echo "sync already in progress — proceeding to wait"
-          else
-            echo "::error::sync failed: HTTP ${SYNC_CODE:-?} ${SYNC_DATA}"
-            exit 1
-          fi
-
-          echo "→ poll for Healthy + Synced (300s timeout)"
-          deadline=$(( $(date +%s) + 300 ))
-          while [ "$(date +%s)" -lt "$deadline" ]; do
-            STATUS=$(call GET "/applications/${SVC}" || echo '{}')
-            HEALTH=$(printf '%s' "$STATUS" | jq -r '.status.health.status // "Unknown"')
-            SYNC=$(printf '%s' "$STATUS" | jq -r '.status.sync.status // "Unknown"')
-            OPERATION=$(printf '%s' "$STATUS" | jq -r '.status.operationState.phase // ""')
-            echo "  health=${HEALTH} sync=${SYNC} op=${OPERATION}"
-            if [ "$HEALTH" = "Healthy" ] && [ "$SYNC" = "Synced" ] && { [ -z "$OPERATION" ] || [ "$OPERATION" = "Succeeded" ]; }; then
-              echo "dev deploy healthy and synced"
-              exit 0
-            fi
-            if [ "$OPERATION" = "Failed" ] || [ "$OPERATION" = "Error" ]; then
-              echo "::error::sync operation $OPERATION"
-              printf '%s' "$STATUS" | jq '.status.operationState.message // empty'
-              exit 1
-            fi
-            sleep 10
-          done
-          echo "::error::deploy did not reach Healthy+Synced within 300s"
-          exit 1
+    permissions:
+      contents: write
+    uses: ./.github/workflows/deploy-dev.yml
+    with:
+      service_name: ${{ inputs.service_name }}
+      image_tag: ${{ needs.docker.outputs.image_tag }}
+    secrets: inherit
 
   # ──────────────────────────────────────────────
   # 4. VERIFY — e2e tests against dev (optional)
