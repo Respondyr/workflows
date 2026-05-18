@@ -132,3 +132,31 @@ jobs:
   - `prod/undercurrentsmb/master-list` → `ARGOCD-PROD-TOKEN`
 - **GitHub App** (`GH_APP_ID` + `GH_APP_PRIVATE_KEY`) for private dep access
 - **ECR repositories** matching `service_name` for each Docker service
+
+## AWS GHA OIDC roles (Phase 2 — AWS migration)
+
+Per-account OIDC roles for CI assume-role. Set `AWS_ROLE_ARN` repo secret
+to the appropriate ARN per job:
+
+- **Dev acct** — `arn:aws:iam::987213268382:role/respondyr-gha-dev`
+  - Trust: any branch/tag in any `Respondyr/*` repo.
+  - Perms: ECR push on dev acct repos + S3 R/W on the shared TF state
+    bucket (`respondyr-platform-terraform-state`). No `DeleteObject`.
+- **Prod acct** — `arn:aws:iam::489889952183:role/respondyr-gha-prod`
+  - Trust: **release-please semver tag refs only** (`refs/tags/v*`). PR
+    builds and main pushes CANNOT assume this role.
+  - Perms: ECR push on prod acct repos. No state access.
+
+Caller contract (per OWASP CICD-SEC-2):
+
+- Set workflow-level `permissions: contents: read` (default-deny).
+- Add `permissions: { id-token: write }` at the **job** level only on
+  jobs that call `aws-actions/configure-aws-credentials`. Do not grant
+  `id-token: write` workflow-wide.
+- Release/tag jobs target the prod role; everything else targets dev.
+
+ECR promotion is **explicit, not replicated.** Dev ECR holds SHA-tagged
+images; prod ECR holds semver-tagged release artifacts. The
+release-please workflow re-tags + pushes to prod ECR (Phase 9 work).
+ECR cross-acct replication is NOT enabled — it can't filter on tag
+patterns, so enabling it would land SHA-tagged dev images in prod ECR.
