@@ -57,6 +57,11 @@ on:
         required: false
         type: string
         default: "platform"
+      aws_role_arn:
+        description: "IAM role for verify-deployment to assume. Default = dev `respondyr-gha-dev`, which has SM read on the Cognito CI blob and EKS view access. NOT the per-service `ecr-push-*` role used by docker-build (that role lacks the needed permissions)."
+        required: false
+        type: string
+        default: "arn:aws:iam::987213268382:role/respondyr-gha-dev"
 
 permissions:
   id-token: write
@@ -71,7 +76,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-to-assume: ${{ inputs.aws_role_arn }}
           aws-region: ${{ vars.AWS_REGION || 'us-east-2' }}
 
       - name: Fetch Cognito CI creds from Secrets Manager
