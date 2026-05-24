@@ -301,7 +301,7 @@ jobs:
   # Delegates to the standalone `deploy-dev.yml` reusable workflow, the
   # same one called from each service's `pr.yml`. That workflow commits
   # the new image tag into helm/values-dev.yaml via a GitHub App token;
-  # ArgoCD on the dev Mini reconciles from git and rolls the pod.
+  # ArgoCD dev reconciles from git and rolls the pod.
   #
   # The previous inline implementation drove ArgoCD's REST API directly
   # (PATCH /applications/<svc>/spec via cloudflared tunnel + CF Access
