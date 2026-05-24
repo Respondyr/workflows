@@ -1,23 +1,25 @@
-# verify-deployment.yml — Reusable rollout verification
+# verify-deployment.yml — Reusable rollout verification (kubectl-based)
 #
 # Confirms the dev cluster is actually serving the image built from a given
-# git SHA before letting integration tests run against it. Two probes:
+# git SHA before integration tests run against it. Reads the live Deployment
+# in the service's namespace and waits for:
 #
-#   1. ArgoCD app sync (preferred) — Cognito OIDC client_credentials exchange
-#      then poll /api/v1/applications/<svc>. Pass when:
-#        status.sync.status   == "Synced"
-#        status.sync.revision == expected_sha
-#        status.health.status == "Healthy"
+#   spec.template.spec.containers[0].image endsWith ":<expected_sha>"
+#   status.observedGeneration >= metadata.generation
+#   status.availableReplicas  == status.replicas (and > 0)
 #
-#   2. Kubectl fallback (on ArgoCD timeout/non-200) — aws eks update-kubeconfig
-#      then read the live Deployment. Pass when:
-#        spec.template.spec.containers[0].image endsWith ":<expected_sha>"
-#        status.observedGeneration >= metadata.generation
-#        status.availableReplicas  == status.replicas
+# Why kubectl-only (initial design also probed ArgoCD): ArgoCD's
+# `status.sync.revision` is the *deploy-dev bot commit* (the [skip ci]
+# commit that bumps helm/values-dev.yaml), NOT the PR's merge SHA we care
+# about. Cross-referencing those needs another round-trip and complicates
+# the workflow without buying real signal — the Deployment image field is
+# already the ground truth. The Cognito M2M + ArgoCD-fast-path is set up
+# in infra (Phase 2 TF, Respondyr/infra#239) and can be added later as
+# Phase 2b if GHA-minute burn becomes measurable.
 #
-# Image-match alone is a false-positive: ArgoCD may have patched the spec
-# while pods are still terminating. observedGeneration + availableReplicas
-# is what proves the new pod is actually serving traffic.
+# Permissions: assumes the dev `respondyr-gha-dev` IAM role (trust policy
+# accepts any Respondyr repo on any ref). That role has `eks:DescribeCluster`
+# and an EKS access entry bound to AmazonEKSViewPolicy.
 
 name: Verify Deployment
 
@@ -25,7 +27,7 @@ on:
   workflow_call:
     inputs:
       service_name:
-        description: "Service name (matches ArgoCD app + Deployment name)"
+        description: "Service name — used as Deployment name and (by default) namespace"
         required: true
         type: string
       expected_sha:
@@ -33,32 +35,22 @@ on:
         required: true
         type: string
       environment:
-        description: "dev | prod (this workflow is only wired for dev today)"
+        description: "dev | prod (only wired for dev today)"
         required: false
         type: string
         default: "dev"
-      argocd_url:
-        description: "ArgoCD base URL"
-        required: false
-        type: string
-        default: "https://argocd-dev.respondyr.com"
-      argocd_timeout_seconds:
-        description: "How long to poll ArgoCD before falling back to kubectl"
+      timeout_seconds:
+        description: "How long to poll the Deployment before failing"
         required: false
         type: number
-        default: 180
-      kubectl_timeout_seconds:
-        description: "How long to poll kubectl after ArgoCD path is exhausted"
-        required: false
-        type: number
-        default: 120
+        default: 240
       namespace:
-        description: "Kubernetes namespace for the Deployment"
+        description: "Kubernetes namespace. Defaults to service_name (each service has its own namespace)."
         required: false
         type: string
-        default: "platform"
+        default: ""
       aws_role_arn:
-        description: "IAM role for verify-deployment to assume. Default = dev `respondyr-gha-dev`, which has SM read on the Cognito CI blob and EKS view access. NOT the per-service `ecr-push-*` role used by docker-build (that role lacks the needed permissions)."
+        description: "IAM role to assume. Default = dev `respondyr-gha-dev` (has EKS view access). NOT the per-service `ecr-push-*` role."
         required: false
         type: string
         default: "arn:aws:iam::987213268382:role/respondyr-gha-dev"
@@ -79,105 +71,54 @@ jobs:
           role-to-assume: ${{ inputs.aws_role_arn }}
           aws-region: ${{ vars.AWS_REGION || 'us-east-2' }}
 
-      - name: Fetch Cognito CI creds from Secrets Manager
-        id: creds
-        run: |
-          set -euo pipefail
-          BLOB=$(aws secretsmanager get-secret-value \
-            --secret-id "ci/argocd/cognito-creds" \
-            --query SecretString --output text)
-          echo "::add-mask::$(echo "$BLOB" | jq -r .client_secret)"
-          {
-            echo "client_id=$(echo "$BLOB" | jq -r .client_id)"
-            echo "token_url=$(echo "$BLOB" | jq -r .token_url)"
-            echo "client_secret=$(echo "$BLOB" | jq -r .client_secret)"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Exchange client_credentials for access_token
-        id: token
-        run: |
-          set -euo pipefail
-          RESP=$(curl -sS -X POST \
-            -H "Content-Type: application/x-www-form-urlencoded" \
-            -d "grant_type=client_credentials" \
-            -d "client_id=${{ steps.creds.outputs.client_id }}" \
-            -d "client_secret=${{ steps.creds.outputs.client_secret }}" \
-            "${{ steps.creds.outputs.token_url }}")
-          TOKEN=$(echo "$RESP" | jq -r .access_token)
-          if [ "$TOKEN" = "null" ] || [ -z "$TOKEN" ]; then
-            echo "::warning::Cognito token exchange failed — will skip ArgoCD probe and try kubectl"
-            echo "argocd_available=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "::add-mask::$TOKEN"
-            echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
-            echo "argocd_available=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Poll ArgoCD app sync
-        id: argocd
-        if: steps.token.outputs.argocd_available == 'true'
-        run: |
-          set -euo pipefail
-          DEADLINE=$(( $(date +%s) + ${{ inputs.argocd_timeout_seconds }} ))
-          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-            APP=$(curl -sS \
-              -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
-              "${{ inputs.argocd_url }}/api/v1/applications/${{ inputs.service_name }}" || echo "{}")
-            SYNC_STATUS=$(echo "$APP" | jq -r '.status.sync.status // ""')
-            SYNC_REV=$(echo "$APP"    | jq -r '.status.sync.revision // ""')
-            HEALTH=$(echo "$APP"      | jq -r '.status.health.status // ""')
-            echo "argo: sync=$SYNC_STATUS rev=${SYNC_REV:0:7} health=$HEALTH expected=${{ inputs.expected_sha }}"
-            if [ "$SYNC_STATUS" = "Synced" ] \
-               && [ "$SYNC_REV" = "${{ inputs.expected_sha }}" ] \
-               && [ "$HEALTH" = "Healthy" ]; then
-              echo "::notice::ArgoCD reports ${{ inputs.service_name }} synced to ${{ inputs.expected_sha }} and Healthy"
-              echo "passed=true" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            sleep 10
-          done
-          echo "::warning::ArgoCD did not converge within ${{ inputs.argocd_timeout_seconds }}s — falling back to kubectl"
-          echo "passed=false" >> "$GITHUB_OUTPUT"
-
       - name: Install kubectl
-        if: steps.argocd.outputs.passed != 'true'
         uses: azure/setup-kubectl@v4
         with:
           version: latest
 
-      - name: Update kubeconfig for dev EKS
-        if: steps.argocd.outputs.passed != 'true'
+      - name: Update kubeconfig
         run: |
           aws eks update-kubeconfig \
             --name "respondyr-${{ inputs.environment }}-eks" \
             --region "${{ vars.AWS_REGION || 'us-east-2' }}"
 
-      - name: Poll Deployment spec + rollout status
-        if: steps.argocd.outputs.passed != 'true'
+      - name: Poll Deployment image + rollout
         run: |
           set -euo pipefail
-          DEADLINE=$(( $(date +%s) + ${{ inputs.kubectl_timeout_seconds }} ))
           SVC="${{ inputs.service_name }}"
           NS="${{ inputs.namespace }}"
+          [ -z "$NS" ] && NS="$SVC"
           SHA="${{ inputs.expected_sha }}"
+          DEADLINE=$(( $(date +%s) + ${{ inputs.timeout_seconds }} ))
+
+          echo "Polling deployment/$SVC in ns/$NS for image :$SHA"
+
           while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-            IMG=$(kubectl -n "$NS" get deployment "$SVC" \
-              -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "")
-            OBS=$(kubectl  -n "$NS" get deployment "$SVC" -o jsonpath='{.status.observedGeneration}' 2>/dev/null || echo 0)
-            GEN=$(kubectl  -n "$NS" get deployment "$SVC" -o jsonpath='{.metadata.generation}'        2>/dev/null || echo 1)
-            AVAIL=$(kubectl -n "$NS" get deployment "$SVC" -o jsonpath='{.status.availableReplicas}'   2>/dev/null || echo 0)
-            DESIRED=$(kubectl -n "$NS" get deployment "$SVC" -o jsonpath='{.status.replicas}'         2>/dev/null || echo 1)
+            # One kubectl call (-o json) to reduce roundtrips + ensure atomic snapshot.
+            DEP=$(kubectl -n "$NS" get deployment "$SVC" -o json 2>&1 || true)
+            if echo "$DEP" | head -1 | grep -qE '^Error|^error:'; then
+              echo "k8s: $DEP"
+              sleep 8
+              continue
+            fi
+            IMG=$(echo     "$DEP" | jq -r '.spec.template.spec.containers[0].image // ""')
+            OBS=$(echo     "$DEP" | jq -r '.status.observedGeneration // 0')
+            GEN=$(echo     "$DEP" | jq -r '.metadata.generation // 1')
+            AVAIL=$(echo   "$DEP" | jq -r '.status.availableReplicas // 0')
+            DESIRED=$(echo "$DEP" | jq -r '.status.replicas // 0')
             echo "k8s: img=${IMG##*:} obsGen=$OBS/$GEN avail=$AVAIL/$DESIRED expected=$SHA"
             case "$IMG" in
               *:"$SHA")
-                if [ "${OBS:-0}" -ge "${GEN:-1}" ] && [ "${AVAIL:-0}" = "${DESIRED:-1}" ] && [ "${DESIRED:-0}" -gt 0 ]; then
-                  echo "::notice::Kubectl confirms $SVC running $SHA, rollout complete"
+                if [ "$OBS" -ge "$GEN" ] && [ "$AVAIL" = "$DESIRED" ] && [ "$DESIRED" -gt 0 ]; then
+                  echo "::notice::$SVC running $SHA, rollout complete ($AVAIL/$DESIRED ready)"
                   exit 0
                 fi
                 ;;
             esac
             sleep 8
           done
-          echo "::error::Deployment $SVC did not reach image=$SHA + rollout-complete within ${{ inputs.kubectl_timeout_seconds }}s"
+
+          echo "::error::deployment/$SVC ns/$NS did not reach image=$SHA + rollout-complete within ${{ inputs.timeout_seconds }}s"
           kubectl -n "$NS" describe deployment "$SVC" || true
+          kubectl -n "$NS" get pods -l app="$SVC" -o wide || true
           exit 1
