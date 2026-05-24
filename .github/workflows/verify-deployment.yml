@@ -1,117 +1,259 @@
-# verify-deployment.yml — Real image-SHA gate via /<svc>/version
+# =============================================================================
+# verify-deployment.yml — ArgoCD-driven verify of dev rollout
+# =============================================================================
 #
-# Polls https://<base_url>/<service_name>/version until the response body
-# matches the PR's expected SHA, with a "confirm streak" so the
-# transient overlap between old and new pods during a Kubernetes rolling
-# restart doesn't produce a false positive.
+# What this does
+# --------------
+# After `deploy-dev.yml` commits a new image SHA to `helm/values-dev.yaml`,
+# this workflow drives ArgoCD to reconcile that change immediately and waits
+# for the rollout to converge before passing control to integration tests.
 #
-# Contract on the service side:
-#   - base-service Helm chart (>= 0.14.0) injects GIT_SHA into the pod
-#     from .Values.deployment.image.tag — the same value deploy-dev.yml
-#     writes per PR.
-#   - The service code exposes /version returning that exact value as the
-#     response body (text/plain, no JSON wrapping).
+# Two ArgoCD CLI calls do the work:
 #
-# Why not kubectl: dev EKS public API endpoint is CIDR-locked to a /32,
-# unreachable from GHA runners. Why not ArgoCD: M2M tokens fail audience
-# verification on the default OIDC config — fixable but more knobs.
+#   1. `argocd app sync <svc>` — forces an immediate sync instead of waiting
+#      for ArgoCD's default 3-minute git poll cycle. ArgoCD reads main, sees
+#      the new image tag in values-dev.yaml, applies the updated Deployment.
+#      Blocks until the sync operation finishes (resources are applied).
 #
-# Limitations:
-#   - If a service forgets to add /version, this will fail until they do.
-#     That's intentional — every service needs the same SHA-gate contract.
-#   - If the service is healthy but returns "unknown" for GIT_SHA, the
-#     match will fail. That's also intentional — it means the Helm chart
-#     didn't inject GIT_SHA (chart out of date, env block override, etc).
+#   2. `argocd app wait <svc> --health --sync` — blocks until ArgoCD reports
+#      both Synced (applied state == git state) and Healthy (Deployment's
+#      .status.availableReplicas equals .status.replicas, observedGeneration
+#      is current, no unschedulable pods). The "rollout is done, new pod is
+#      serving" gate.
+#
+# Why this approach
+# -----------------
+# ArgoCD is the entity that APPLIES changes to the cluster. Its own health
+# report is the authoritative signal for "did my last commit land?" — it
+# reads the Kubernetes API directly from inside the cluster.
+#
+# What we do NOT need:
+#   - Per-service /version endpoints (the pod self-reporting its SHA)
+#   - HTTP body polling from outside the cluster
+#   - GIT_SHA env injection at the Helm chart level
+#   - kubectl from GitHub Actions (which would require opening the EKS
+#     public endpoint past its current /32 allowlist)
+#
+# Auth
+# ----
+# The ArgoCD apiKey token is an admin-scoped JWT stored in AWS Secrets
+# Manager at `platform/argocd/<environment>` under the key `ci-token`.
+# The workflow:
+#
+#   1. Assumes the GHA IAM role `respondyr-gha-dev` via OIDC (trust policy
+#      accepts any Respondyr repo on any ref).
+#   2. Reads the SM blob (the role's `gha_verify_deployment` inline policy
+#      grants `secretsmanager:GetSecretValue` on that blob — see
+#      infra/terraform/shared/env-dev/02-ci-cognito-m2m.tf).
+#   3. Calls argocd CLI with `--auth-token` directly (no `argocd login`
+#      session cache file needed for a single short workflow run).
+#
+# Security note: the apiKey is admin-scoped today. Future hardening — move
+# CI to a dedicated ArgoCD account with `applications, sync` RBAC only
+# (no `applications, delete`, no `repositories, *`, no `clusters, *`).
+# Tracked as a follow-up. Risk today: a compromised CI token could force
+# resyncs of any app (noisy, not damaging) but cannot delete apps or change
+# cluster configuration.
+# =============================================================================
 
 name: Verify Deployment
 
 on:
   workflow_call:
     inputs:
+      # Required — must match the ArgoCD Application name (which in this
+      # platform always equals the service repo name and the K8s namespace).
       service_name:
-        description: "Service name — used in URL path: <base_url>/<service_name>/version"
+        description: "Service name — also the ArgoCD Application name + K8s namespace"
         required: true
         type: string
+
+      # Deprecated — kept so existing callers don't break. Previous versions
+      # of this workflow polled /<svc>/version and matched the body to this
+      # SHA; the current ArgoCD-driven version no longer needs it (ArgoCD's
+      # own Healthy + Synced report is the gate). Callers can stop passing
+      # it on their next pr.yml update; leaving it in is harmless.
       expected_sha:
-        description: "Git SHA the pod should be running (PR merge commit's github.sha)"
-        required: true
-        type: string
-      base_url:
-        description: "Dev API base URL"
-        required: false
-        type: string
-        default: "https://dev-api.respondyr.com"
-      version_path:
-        description: "Path appended to base_url. Default is conventional `/<svc>/version`."
+        description: "[DEPRECATED — unused] PR's expected git SHA. ArgoCD now provides the gate."
         required: false
         type: string
         default: ""
-      timeout_seconds:
-        description: "How long to poll before failing"
+
+      # Optional — defaults work for the dev path. Override for prod variants.
+      environment:
+        description: |
+          Which environment to target. Affects two things:
+            (1) the SM blob path: platform/argocd/<environment>
+            (2) the default argocd_server URL (when not overridden)
+          Today only "dev" is wired. The prod path will need its own SM blob
+          and role, separate from this dev-only role.
+        required: false
+        type: string
+        default: "dev"
+
+      argocd_server:
+        description: |
+          ArgoCD server hostname (no scheme). Defaults to
+          argocd-<env>.respondyr.com, which is the Cloudflare-tunneled
+          public ingress for the ArgoCD UI + API.
+        required: false
+        type: string
+        default: ""
+
+      sync_timeout_seconds:
+        description: |
+          Hard cap on how long `argocd app sync` waits for the sync operation
+          to complete. Sync itself is usually fast (seconds) — this is just
+          a safety net for stuck operations.
         required: false
         type: number
-        default: 360
-      confirm_streak:
-        description: "Number of consecutive matching responses required before exit 0. Defeats the rolling-restart overlap window where ingress may briefly route to the old pod."
+        default: 120
+
+      wait_timeout_seconds:
+        description: |
+          Hard cap on `argocd app wait --health --sync`. This is the real
+          budget — covers the Deployment rolling-restart time (new pod
+          starts, becomes ready, old pod terminates). 240s is enough for a
+          single-pod dev rollout; bump if a service's image is slow to pull.
         required: false
         type: number
-        default: 3
-      poll_interval_seconds:
-        description: "Seconds between polls"
+        default: 240
+
+      argocd_cli_version:
+        description: |
+          Version of the argocd CLI binary to download. Pin to match the
+          server version (currently v3.3.6 in dev). Newer clients are
+          usually backwards-compatible but pinning avoids surprises.
         required: false
-        type: number
-        default: 5
+        type: string
+        default: "v3.3.6"
+
+      aws_role_arn:
+        description: |
+          IAM role to assume for SM read. Default = dev `respondyr-gha-dev`,
+          which has SM read on platform/argocd/dev. NOT the per-service
+          `ecr-push-*` role used by docker-build (that role can't read this).
+        required: false
+        type: string
+        default: "arn:aws:iam::987213268382:role/respondyr-gha-dev"
 
 permissions:
+  # Required to assume the GHA OIDC role.
+  id-token: write
+  # Some action providers refuse to run without an explicit contents perm.
   contents: read
 
 jobs:
   verify:
     name: Verify Deployment
     runs-on: ubuntu-latest
+    # Job-level backstop. The CLI calls have their own timeouts (the inputs
+    # above) that should fire first under normal conditions.
     timeout-minutes: 10
     steps:
-      - name: Poll /version for SHA match
+      # ---------------------------------------------------------------------
+      # 1. Authenticate to AWS via OIDC so we can read the SM blob.
+      # ---------------------------------------------------------------------
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-2' }}
+
+      # ---------------------------------------------------------------------
+      # 2. Read the ArgoCD CI token from Secrets Manager. The blob also has
+      #    url/username/password, but for a non-interactive CI run the apiKey
+      #    token is preferable (no session-cache file, no login round-trip,
+      #    survives ArgoCD admin-password rotations).
+      # ---------------------------------------------------------------------
+      - name: Fetch ArgoCD CI token from Secrets Manager
+        id: argocd_creds
         run: |
-          SVC="${{ inputs.service_name }}"
-          BASE="${{ inputs.base_url }}"
-          PATH_IN="${{ inputs.version_path }}"
-          [ -z "$PATH_IN" ] && PATH_IN="/${SVC}/version"
-          URL="${BASE}${PATH_IN}"
-          SHA="${{ inputs.expected_sha }}"
-          DEADLINE=$(( $(date +%s) + ${{ inputs.timeout_seconds }} ))
-          STREAK=0
-          REQUIRED=${{ inputs.confirm_streak }}
+          set -euo pipefail
+          BLOB=$(aws secretsmanager get-secret-value \
+            --secret-id "platform/argocd/${{ inputs.environment }}" \
+            --query SecretString --output text)
+          TOKEN=$(echo "$BLOB" | jq -r '."ci-token"')
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "::error::SM blob platform/argocd/${{ inputs.environment }} has no ci-token field"
+            exit 1
+          fi
+          # Mask the token in any subsequent log output. GHA log capture
+          # would otherwise echo it back if a downstream step prints env.
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
 
-          echo "Polling $URL for body exactly == $SHA (need $REQUIRED consecutive matches)"
+          # Resolve server hostname: explicit input wins, otherwise default
+          # to argocd-<env>.respondyr.com.
+          SERVER="${{ inputs.argocd_server }}"
+          [ -z "$SERVER" ] && SERVER="argocd-${{ inputs.environment }}.respondyr.com"
+          echo "server=$SERVER" >> "$GITHUB_OUTPUT"
 
-          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-            # --max-time keeps a stalled connection from eating the full poll interval.
-            # Capture body + http code so we can distinguish "404 path missing" from
-            # "200 but wrong SHA" from "5xx pod restarting".
-            RESP=$(curl -sS -o /tmp/body -w "%{http_code}" --max-time 6 "$URL" || echo "000")
-            BODY=$(head -c 64 /tmp/body 2>/dev/null | tr -d '[:space:]')
-            ELAPSED=$(( ${{ inputs.timeout_seconds }} - DEADLINE + $(date +%s) ))
-            if [ "$RESP" = "200" ] && [ "$BODY" = "$SHA" ]; then
-              STREAK=$((STREAK + 1))
-              echo "http: $URL → $RESP body=$BODY (match $STREAK/$REQUIRED, t+${ELAPSED}s)"
-              if [ "$STREAK" -ge "$REQUIRED" ]; then
-                echo "::notice::$SVC /version returns $SHA on $REQUIRED consecutive polls — new pod confirmed serving"
-                exit 0
-              fi
-            else
-              if [ "$STREAK" -gt 0 ]; then
-                echo "http: $URL → $RESP body=${BODY:-<empty>} (streak reset from $STREAK, t+${ELAPSED}s)"
-              else
-                echo "http: $URL → $RESP body=${BODY:-<empty>} (t+${ELAPSED}s)"
-              fi
-              STREAK=0
-            fi
-            sleep ${{ inputs.poll_interval_seconds }}
-          done
+      # ---------------------------------------------------------------------
+      # 3. Install the argocd CLI from the official release artifact. Pinned
+      #    to a known version so we don't surprise-upgrade on every run.
+      # ---------------------------------------------------------------------
+      - name: Install argocd CLI
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.argocd_cli_version }}"
+          curl -sSL -o /tmp/argocd \
+            "https://github.com/argoproj/argo-cd/releases/download/${VERSION}/argocd-linux-amd64"
+          chmod +x /tmp/argocd
+          sudo mv /tmp/argocd /usr/local/bin/argocd
+          argocd version --client | head -1
 
-          echo "::error::$URL never produced $REQUIRED consecutive responses with body=$SHA within ${{ inputs.timeout_seconds }}s"
-          echo "::error::Last response: $RESP body=${BODY:-<empty>}"
-          echo "::error::If body was 'unknown', the base-service chart didn't inject GIT_SHA — check the service is on base-service >= 0.14.0."
-          echo "::error::If 404, the service is missing the /version handler — see workspace-docs/cicd/PLAN-AUTOMATED-RELEASE-WORKFLOWS.html Phase 4."
-          exit 1
+      # ---------------------------------------------------------------------
+      # 4. Force an immediate sync. Without this, ArgoCD waits up to 3 minutes
+      #    (its default git poll interval) before noticing the new image tag
+      #    deploy-dev.yml just pushed. `--timeout` here governs how long
+      #    ArgoCD waits for the sync OPERATION to complete — separate from
+      #    the rollout-converge wait in the next step.
+      # ---------------------------------------------------------------------
+      - name: ArgoCD app sync
+        env:
+          ARGOCD_TOKEN: ${{ steps.argocd_creds.outputs.token }}
+          ARGOCD_SERVER: ${{ steps.argocd_creds.outputs.server }}
+        run: |
+          set -euo pipefail
+          argocd app sync "${{ inputs.service_name }}" \
+            --server "$ARGOCD_SERVER" \
+            --auth-token "$ARGOCD_TOKEN" \
+            --grpc-web \
+            --timeout ${{ inputs.sync_timeout_seconds }}
+
+      # ---------------------------------------------------------------------
+      # 5. Wait for the app to reach Synced + Healthy. This is the actual
+      #    rollout-converged signal: Healthy means the Deployment's
+      #    availableReplicas equals replicas, observedGeneration is current,
+      #    no unschedulable pods. The new pod from this PR is serving.
+      # ---------------------------------------------------------------------
+      - name: ArgoCD app wait — Healthy + Synced
+        env:
+          ARGOCD_TOKEN: ${{ steps.argocd_creds.outputs.token }}
+          ARGOCD_SERVER: ${{ steps.argocd_creds.outputs.server }}
+        run: |
+          set -euo pipefail
+          argocd app wait "${{ inputs.service_name }}" \
+            --server "$ARGOCD_SERVER" \
+            --auth-token "$ARGOCD_TOKEN" \
+            --grpc-web \
+            --health \
+            --sync \
+            --timeout ${{ inputs.wait_timeout_seconds }}
+
+      # ---------------------------------------------------------------------
+      # 6. Print final app status as a paper trail in the job log. Useful for
+      #    forensic debug when a downstream integration test fails — answers
+      #    "what state did ArgoCD think this app was in when verify passed?"
+      # ---------------------------------------------------------------------
+      - name: Print final app status
+        if: always()
+        env:
+          ARGOCD_TOKEN: ${{ steps.argocd_creds.outputs.token }}
+          ARGOCD_SERVER: ${{ steps.argocd_creds.outputs.server }}
+        run: |
+          argocd app get "${{ inputs.service_name }}" \
+            --server "$ARGOCD_SERVER" \
+            --auth-token "$ARGOCD_TOKEN" \
+            --grpc-web || true
