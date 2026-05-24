@@ -1,25 +1,29 @@
-# verify-deployment.yml — Reusable rollout verification (kubectl-based)
+# verify-deployment.yml — Reusable rollout verification (HTTP health poll)
 #
-# Confirms the dev cluster is actually serving the image built from a given
-# git SHA before integration tests run against it. Reads the live Deployment
-# in the service's namespace and waits for:
+# Polls the service's public /<svc>/health endpoint on dev until 200,
+# then waits a short settle window so ArgoCD's rolling restart can
+# replace the old pod. After this job exits 0, integration-test.yml
+# runs assertions against the now-stable dev surface.
 #
-#   spec.template.spec.containers[0].image endsWith ":<expected_sha>"
-#   status.observedGeneration >= metadata.generation
-#   status.availableReplicas  == status.replicas (and > 0)
+# Why HTTP instead of kubectl or ArgoCD:
+#   - The dev EKS public API server is CIDR-locked to a /32 — GitHub
+#     Actions runners on Azure can't reach it.
+#   - ArgoCD's /api/v1/applications/<svc> requires JWT validation against
+#     its configured user-flow Cognito client; M2M tokens fail audience
+#     verification. Fixable, but adds two more knobs (allowedAudiences,
+#     RBAC for the M2M sub) for marginal benefit.
+#   - The public ingress at https://dev-api.respondyr.com/<svc>/health
+#     already proves the pod is up and serving. After deploy-dev commits
+#     the new image SHA and ArgoCD reconciles, a successful /health is
+#     strong-enough evidence to let integration tests run.
 #
-# Why kubectl-only (initial design also probed ArgoCD): ArgoCD's
-# `status.sync.revision` is the *deploy-dev bot commit* (the [skip ci]
-# commit that bumps helm/values-dev.yaml), NOT the PR's merge SHA we care
-# about. Cross-referencing those needs another round-trip and complicates
-# the workflow without buying real signal — the Deployment image field is
-# already the ground truth. The Cognito M2M + ArgoCD-fast-path is set up
-# in infra (Phase 2 TF, Respondyr/infra#239) and can be added later as
-# Phase 2b if GHA-minute burn becomes measurable.
-#
-# Permissions: assumes the dev `respondyr-gha-dev` IAM role (trust policy
-# accepts any Respondyr repo on any ref). That role has `eks:DescribeCluster`
-# and an EKS access entry bound to AmazonEKSViewPolicy.
+# Limitations (accepted Day 1, revisit if AI PR volume makes them real):
+#   - No image-SHA-match check — a flaky old pod that responds 200 will
+#     fool this. Mitigation: integration tests should assert new behavior.
+#   - Fixed settle window after first 200 (default 30s) covers the typical
+#     single-pod rolling restart on dev. Tunable per service via input.
+#   - Cognito M2M client + IAM/EKS access entry from Respondyr/infra#239
+#     are intentionally left in place for the Phase 2b ArgoCD path.
 
 name: Verify Deployment
 
@@ -27,36 +31,36 @@ on:
   workflow_call:
     inputs:
       service_name:
-        description: "Service name — used as Deployment name and (by default) namespace"
+        description: "Service name — used in the URL path: <base_url>/<service_name>/health"
         required: true
         type: string
       expected_sha:
-        description: "Git SHA the pod should be running (usually github.sha of the PR)"
-        required: true
-        type: string
-      environment:
-        description: "dev | prod (only wired for dev today)"
-        required: false
-        type: string
-        default: "dev"
-      timeout_seconds:
-        description: "How long to poll the Deployment before failing"
-        required: false
-        type: number
-        default: 240
-      namespace:
-        description: "Kubernetes namespace. Defaults to service_name (each service has its own namespace)."
+        description: "PR's merge SHA. Logged for debugging; not asserted here (no /version endpoint yet)."
         required: false
         type: string
         default: ""
-      aws_role_arn:
-        description: "IAM role to assume. Default = dev `respondyr-gha-dev` (has EKS view access). NOT the per-service `ecr-push-*` role."
+      base_url:
+        description: "Dev API base URL"
         required: false
         type: string
-        default: "arn:aws:iam::987213268382:role/respondyr-gha-dev"
+        default: "https://dev-api.respondyr.com"
+      health_path:
+        description: "Path appended to base_url for the health check. Default is conventional `/<svc>/health`."
+        required: false
+        type: string
+        default: ""
+      timeout_seconds:
+        description: "How long to poll before failing"
+        required: false
+        type: number
+        default: 300
+      settle_seconds:
+        description: "After first 200 response, wait this long before exiting 0 to let the rolling restart finish."
+        required: false
+        type: number
+        default: 30
 
 permissions:
-  id-token: write
   contents: read
 
 jobs:
@@ -65,62 +69,29 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5
-        with:
-          role-to-assume: ${{ inputs.aws_role_arn }}
-          aws-region: ${{ vars.AWS_REGION || 'us-east-2' }}
-
-      - name: Install kubectl
-        uses: azure/setup-kubectl@v4
-        with:
-          version: latest
-
-      - name: Update kubeconfig
-        run: |
-          aws eks update-kubeconfig \
-            --name "respondyr-${{ inputs.environment }}-eks" \
-            --region "${{ vars.AWS_REGION || 'us-east-2' }}"
-
-      - name: Poll Deployment image + rollout
+      - name: Poll health endpoint
         run: |
           SVC="${{ inputs.service_name }}"
-          NS="${{ inputs.namespace }}"
-          [ -z "$NS" ] && NS="$SVC"
+          BASE="${{ inputs.base_url }}"
+          PATH_IN="${{ inputs.health_path }}"
+          [ -z "$PATH_IN" ] && PATH_IN="/${SVC}/health"
+          URL="${BASE}${PATH_IN}"
           SHA="${{ inputs.expected_sha }}"
           DEADLINE=$(( $(date +%s) + ${{ inputs.timeout_seconds }} ))
 
-          echo "Polling deployment/$SVC in ns/$NS for image :$SHA"
+          echo "Polling $URL (expected_sha=${SHA:-n/a}, timeout=${{ inputs.timeout_seconds }}s, settle=${{ inputs.settle_seconds }}s)"
 
-          # Loop is defensive: each kubectl/jq call uses a default so transient
-          # NotFound (deployment not yet created), parse errors, or empty output
-          # don't blow up the script. `set -e` deliberately omitted.
           while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-            DEP=$(kubectl -n "$NS" get deployment "$SVC" -o json 2>/dev/null)
-            if [ -z "$DEP" ]; then
-              echo "k8s: deployment/$SVC not yet visible in ns/$NS"
-              sleep 8
-              continue
+            CODE=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 8 "$URL" || echo "000")
+            ELAPSED=$(( $(date +%s) + ${{ inputs.timeout_seconds }} - DEADLINE ))
+            echo "http: $URL → $CODE (t+${ELAPSED}s)"
+            if [ "$CODE" = "200" ]; then
+              echo "::notice::$SVC /health returned 200 — settling ${{ inputs.settle_seconds }}s for rolling restart to complete"
+              sleep ${{ inputs.settle_seconds }}
+              exit 0
             fi
-            IMG=$(printf '%s' "$DEP"     | jq -r '.spec.template.spec.containers[0].image // ""' 2>/dev/null)
-            OBS=$(printf '%s' "$DEP"     | jq -r '.status.observedGeneration // 0'              2>/dev/null)
-            GEN=$(printf '%s' "$DEP"     | jq -r '.metadata.generation // 1'                    2>/dev/null)
-            AVAIL=$(printf '%s' "$DEP"   | jq -r '.status.availableReplicas // 0'               2>/dev/null)
-            DESIRED=$(printf '%s' "$DEP" | jq -r '.status.replicas // 0'                        2>/dev/null)
-            : "${IMG:=}" "${OBS:=0}" "${GEN:=1}" "${AVAIL:=0}" "${DESIRED:=0}"
-            echo "k8s: img=${IMG##*:} obsGen=$OBS/$GEN avail=$AVAIL/$DESIRED expected=$SHA"
-            case "$IMG" in
-              *:"$SHA")
-                if [ "$OBS" -ge "$GEN" ] && [ "$AVAIL" = "$DESIRED" ] && [ "$DESIRED" -gt 0 ]; then
-                  echo "::notice::$SVC running $SHA, rollout complete ($AVAIL/$DESIRED ready)"
-                  exit 0
-                fi
-                ;;
-            esac
             sleep 8
           done
 
-          echo "::error::deployment/$SVC ns/$NS did not reach image=$SHA + rollout-complete within ${{ inputs.timeout_seconds }}s"
-          kubectl -n "$NS" describe deployment "$SVC" || true
-          kubectl -n "$NS" get pods -l app="$SVC" -o wide || true
+          echo "::error::$URL did not return 200 within ${{ inputs.timeout_seconds }}s"
           exit 1
