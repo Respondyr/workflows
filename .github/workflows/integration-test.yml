@@ -1,0 +1,176 @@
+# integration-test.yml — Reusable integration test runner
+#
+# Runs service-owned tests against the deployed dev environment AFTER
+# verify-deployment.yml has confirmed the pod is serving the PR's SHA.
+#
+# Test location convention:
+#   - Go:     files tagged `//go:build integration` anywhere in the repo.
+#             Invoked via `go test -tags=integration -count=1 ./...`
+#             The build tag keeps unit `go test ./...` fast (PR test job
+#             doesn't pull these in).
+#   - Python: tests under `tests/integration/`. Invoked via
+#             `pytest tests/integration/ -v --tb=short`.
+#
+# Per-service concurrency group serializes PR runs against the shared dev
+# cluster. PRs targeting the same service queue; PRs across services run
+# in parallel. Trade-off accepted in PLAN-AUTOMATED-RELEASE-WORKFLOWS.html:
+# simpler than per-PR tenant scoping, revisit if AI PR volume saturates.
+
+name: Integration Test
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        description: "go | python"
+        required: true
+        type: string
+      service_name:
+        description: "Service name (used in concurrency group + env)"
+        required: true
+        type: string
+      base_url:
+        description: "Dev API base URL — exported as DEV_BASE_URL to tests"
+        required: false
+        type: string
+        default: "https://dev-api.respondyr.com"
+      timeout_minutes:
+        description: "Hard timeout for the integration test job"
+        required: false
+        type: number
+        default: 15
+      # --- Go ---
+      go_version:
+        required: false
+        type: string
+        default: "1.25"
+      has_auth_dep:
+        required: false
+        type: boolean
+        default: false
+      has_rabbit_dep:
+        required: false
+        type: boolean
+        default: false
+      go_test_args:
+        description: "Override args passed to `go test`. Default runs all integration-tagged files."
+        required: false
+        type: string
+        default: "-tags=integration -count=1 -timeout=10m ./..."
+      # --- Python ---
+      python_version:
+        required: false
+        type: string
+        default: "3.12"
+      install_method:
+        description: "pip (requirements.txt) or editable (pyproject.toml)"
+        required: false
+        type: string
+        default: "pip"
+      pytest_args:
+        description: "Override args passed to pytest."
+        required: false
+        type: string
+        default: "tests/integration/ -v --tb=short"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: integration-${{ inputs.service_name }}
+  cancel-in-progress: false
+
+jobs:
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    env:
+      DEV_BASE_URL: ${{ inputs.base_url }}
+      SERVICE_NAME: ${{ inputs.service_name }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # --- Private-dep clones (Go only) ---
+      - name: Generate GitHub App token
+        if: inputs.language == 'go' && (inputs.has_auth_dep || inputs.has_rabbit_dep)
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: Respondyr
+          repositories: auth-go,shared-go-rabbit
+
+      - name: Clone auth-go for replace directive
+        if: inputs.language == 'go' && inputs.has_auth_dep
+        run: |
+          git clone --depth 1 \
+            https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/Respondyr/auth-go.git \
+            ${{ github.workspace }}/../auth-go
+
+      - name: Clone shared-go-rabbit for replace directive
+        if: inputs.language == 'go' && inputs.has_rabbit_dep
+        run: |
+          git clone --depth 1 \
+            https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/Respondyr/shared-go-rabbit.git \
+            ${{ github.workspace }}/../shared-go-rabbit
+
+      # --- Go path ---
+      - name: Set up Go
+        if: inputs.language == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go_version }}
+          cache: true
+
+      - name: Run Go integration tests
+        if: inputs.language == 'go'
+        run: |
+          set -euo pipefail
+          echo "DEV_BASE_URL=$DEV_BASE_URL"
+          go test ${{ inputs.go_test_args }}
+
+      # --- Python path ---
+      - name: Set up Python
+        if: inputs.language == 'python'
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Install Python deps (pip)
+        if: inputs.language == 'python' && inputs.install_method == 'pip'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest httpx 2>/dev/null || true
+
+      - name: Configure git for private deps (editable)
+        if: inputs.language == 'python' && inputs.install_method == 'editable'
+        run: git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Install Python deps (editable)
+        if: inputs.language == 'python' && inputs.install_method == 'editable'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run Python integration tests
+        if: inputs.language == 'python'
+        run: |
+          set -euo pipefail
+          echo "DEV_BASE_URL=$DEV_BASE_URL"
+          pytest ${{ inputs.pytest_args }}
+
+      - name: Upload test artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-${{ inputs.service_name }}
+          path: |
+            ./test-results/
+            ./pytest-report/
+            ./*.log
+          retention-days: 7
+          if-no-files-found: ignore
