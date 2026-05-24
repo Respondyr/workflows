@@ -1,29 +1,27 @@
-# verify-deployment.yml — Reusable rollout verification (HTTP health poll)
+# verify-deployment.yml — Real image-SHA gate via /<svc>/version
 #
-# Polls the service's public /<svc>/health endpoint on dev until 200,
-# then waits a short settle window so ArgoCD's rolling restart can
-# replace the old pod. After this job exits 0, integration-test.yml
-# runs assertions against the now-stable dev surface.
+# Polls https://<base_url>/<service_name>/version until the response body
+# matches the PR's expected SHA, with a "confirm streak" so the
+# transient overlap between old and new pods during a Kubernetes rolling
+# restart doesn't produce a false positive.
 #
-# Why HTTP instead of kubectl or ArgoCD:
-#   - The dev EKS public API server is CIDR-locked to a /32 — GitHub
-#     Actions runners on Azure can't reach it.
-#   - ArgoCD's /api/v1/applications/<svc> requires JWT validation against
-#     its configured user-flow Cognito client; M2M tokens fail audience
-#     verification. Fixable, but adds two more knobs (allowedAudiences,
-#     RBAC for the M2M sub) for marginal benefit.
-#   - The public ingress at https://dev-api.respondyr.com/<svc>/health
-#     already proves the pod is up and serving. After deploy-dev commits
-#     the new image SHA and ArgoCD reconciles, a successful /health is
-#     strong-enough evidence to let integration tests run.
+# Contract on the service side:
+#   - base-service Helm chart (>= 0.14.0) injects GIT_SHA into the pod
+#     from .Values.deployment.image.tag — the same value deploy-dev.yml
+#     writes per PR.
+#   - The service code exposes /version returning that exact value as the
+#     response body (text/plain, no JSON wrapping).
 #
-# Limitations (accepted Day 1, revisit if AI PR volume makes them real):
-#   - No image-SHA-match check — a flaky old pod that responds 200 will
-#     fool this. Mitigation: integration tests should assert new behavior.
-#   - Fixed settle window after first 200 (default 30s) covers the typical
-#     single-pod rolling restart on dev. Tunable per service via input.
-#   - Cognito M2M client + IAM/EKS access entry from Respondyr/infra#239
-#     are intentionally left in place for the Phase 2b ArgoCD path.
+# Why not kubectl: dev EKS public API endpoint is CIDR-locked to a /32,
+# unreachable from GHA runners. Why not ArgoCD: M2M tokens fail audience
+# verification on the default OIDC config — fixable but more knobs.
+#
+# Limitations:
+#   - If a service forgets to add /version, this will fail until they do.
+#     That's intentional — every service needs the same SHA-gate contract.
+#   - If the service is healthy but returns "unknown" for GIT_SHA, the
+#     match will fail. That's also intentional — it means the Helm chart
+#     didn't inject GIT_SHA (chart out of date, env block override, etc).
 
 name: Verify Deployment
 
@@ -31,21 +29,20 @@ on:
   workflow_call:
     inputs:
       service_name:
-        description: "Service name — used in the URL path: <base_url>/<service_name>/health"
+        description: "Service name — used in URL path: <base_url>/<service_name>/version"
         required: true
         type: string
       expected_sha:
-        description: "PR's merge SHA. Logged for debugging; not asserted here (no /version endpoint yet)."
-        required: false
+        description: "Git SHA the pod should be running (PR merge commit's github.sha)"
+        required: true
         type: string
-        default: ""
       base_url:
         description: "Dev API base URL"
         required: false
         type: string
         default: "https://dev-api.respondyr.com"
-      health_path:
-        description: "Path appended to base_url for the health check. Default is conventional `/<svc>/health`."
+      version_path:
+        description: "Path appended to base_url. Default is conventional `/<svc>/version`."
         required: false
         type: string
         default: ""
@@ -53,12 +50,17 @@ on:
         description: "How long to poll before failing"
         required: false
         type: number
-        default: 300
-      settle_seconds:
-        description: "After first 200 response, wait this long before exiting 0 to let the rolling restart finish."
+        default: 360
+      confirm_streak:
+        description: "Number of consecutive matching responses required before exit 0. Defeats the rolling-restart overlap window where ingress may briefly route to the old pod."
         required: false
         type: number
-        default: 30
+        default: 3
+      poll_interval_seconds:
+        description: "Seconds between polls"
+        required: false
+        type: number
+        default: 5
 
 permissions:
   contents: read
@@ -67,31 +69,49 @@ jobs:
   verify:
     name: Verify Deployment
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
     steps:
-      - name: Poll health endpoint
+      - name: Poll /version for SHA match
         run: |
           SVC="${{ inputs.service_name }}"
           BASE="${{ inputs.base_url }}"
-          PATH_IN="${{ inputs.health_path }}"
-          [ -z "$PATH_IN" ] && PATH_IN="/${SVC}/health"
+          PATH_IN="${{ inputs.version_path }}"
+          [ -z "$PATH_IN" ] && PATH_IN="/${SVC}/version"
           URL="${BASE}${PATH_IN}"
           SHA="${{ inputs.expected_sha }}"
           DEADLINE=$(( $(date +%s) + ${{ inputs.timeout_seconds }} ))
+          STREAK=0
+          REQUIRED=${{ inputs.confirm_streak }}
 
-          echo "Polling $URL (expected_sha=${SHA:-n/a}, timeout=${{ inputs.timeout_seconds }}s, settle=${{ inputs.settle_seconds }}s)"
+          echo "Polling $URL for body exactly == $SHA (need $REQUIRED consecutive matches)"
 
           while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-            CODE=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 8 "$URL" || echo "000")
-            ELAPSED=$(( $(date +%s) + ${{ inputs.timeout_seconds }} - DEADLINE ))
-            echo "http: $URL → $CODE (t+${ELAPSED}s)"
-            if [ "$CODE" = "200" ]; then
-              echo "::notice::$SVC /health returned 200 — settling ${{ inputs.settle_seconds }}s for rolling restart to complete"
-              sleep ${{ inputs.settle_seconds }}
-              exit 0
+            # --max-time keeps a stalled connection from eating the full poll interval.
+            # Capture body + http code so we can distinguish "404 path missing" from
+            # "200 but wrong SHA" from "5xx pod restarting".
+            RESP=$(curl -sS -o /tmp/body -w "%{http_code}" --max-time 6 "$URL" || echo "000")
+            BODY=$(head -c 64 /tmp/body 2>/dev/null | tr -d '[:space:]')
+            ELAPSED=$(( ${{ inputs.timeout_seconds }} - DEADLINE + $(date +%s) ))
+            if [ "$RESP" = "200" ] && [ "$BODY" = "$SHA" ]; then
+              STREAK=$((STREAK + 1))
+              echo "http: $URL → $RESP body=$BODY (match $STREAK/$REQUIRED, t+${ELAPSED}s)"
+              if [ "$STREAK" -ge "$REQUIRED" ]; then
+                echo "::notice::$SVC /version returns $SHA on $REQUIRED consecutive polls — new pod confirmed serving"
+                exit 0
+              fi
+            else
+              if [ "$STREAK" -gt 0 ]; then
+                echo "http: $URL → $RESP body=${BODY:-<empty>} (streak reset from $STREAK, t+${ELAPSED}s)"
+              else
+                echo "http: $URL → $RESP body=${BODY:-<empty>} (t+${ELAPSED}s)"
+              fi
+              STREAK=0
             fi
-            sleep 8
+            sleep ${{ inputs.poll_interval_seconds }}
           done
 
-          echo "::error::$URL did not return 200 within ${{ inputs.timeout_seconds }}s"
+          echo "::error::$URL never produced $REQUIRED consecutive responses with body=$SHA within ${{ inputs.timeout_seconds }}s"
+          echo "::error::Last response: $RESP body=${BODY:-<empty>}"
+          echo "::error::If body was 'unknown', the base-service chart didn't inject GIT_SHA — check the service is on base-service >= 0.14.0."
+          echo "::error::If 404, the service is missing the /version handler — see workspace-docs/cicd/PLAN-AUTOMATED-RELEASE-WORKFLOWS.html Phase 4."
           exit 1
