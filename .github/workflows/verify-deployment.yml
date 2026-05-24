@@ -84,7 +84,6 @@ jobs:
 
       - name: Poll Deployment image + rollout
         run: |
-          set -euo pipefail
           SVC="${{ inputs.service_name }}"
           NS="${{ inputs.namespace }}"
           [ -z "$NS" ] && NS="$SVC"
@@ -93,19 +92,22 @@ jobs:
 
           echo "Polling deployment/$SVC in ns/$NS for image :$SHA"
 
+          # Loop is defensive: each kubectl/jq call uses a default so transient
+          # NotFound (deployment not yet created), parse errors, or empty output
+          # don't blow up the script. `set -e` deliberately omitted.
           while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-            # One kubectl call (-o json) to reduce roundtrips + ensure atomic snapshot.
-            DEP=$(kubectl -n "$NS" get deployment "$SVC" -o json 2>&1 || true)
-            if echo "$DEP" | head -1 | grep -qE '^Error|^error:'; then
-              echo "k8s: $DEP"
+            DEP=$(kubectl -n "$NS" get deployment "$SVC" -o json 2>/dev/null)
+            if [ -z "$DEP" ]; then
+              echo "k8s: deployment/$SVC not yet visible in ns/$NS"
               sleep 8
               continue
             fi
-            IMG=$(echo     "$DEP" | jq -r '.spec.template.spec.containers[0].image // ""')
-            OBS=$(echo     "$DEP" | jq -r '.status.observedGeneration // 0')
-            GEN=$(echo     "$DEP" | jq -r '.metadata.generation // 1')
-            AVAIL=$(echo   "$DEP" | jq -r '.status.availableReplicas // 0')
-            DESIRED=$(echo "$DEP" | jq -r '.status.replicas // 0')
+            IMG=$(printf '%s' "$DEP"     | jq -r '.spec.template.spec.containers[0].image // ""' 2>/dev/null)
+            OBS=$(printf '%s' "$DEP"     | jq -r '.status.observedGeneration // 0'              2>/dev/null)
+            GEN=$(printf '%s' "$DEP"     | jq -r '.metadata.generation // 1'                    2>/dev/null)
+            AVAIL=$(printf '%s' "$DEP"   | jq -r '.status.availableReplicas // 0'               2>/dev/null)
+            DESIRED=$(printf '%s' "$DEP" | jq -r '.status.replicas // 0'                        2>/dev/null)
+            : "${IMG:=}" "${OBS:=0}" "${GEN:=1}" "${AVAIL:=0}" "${DESIRED:=0}"
             echo "k8s: img=${IMG##*:} obsGen=$OBS/$GEN avail=$AVAIL/$DESIRED expected=$SHA"
             case "$IMG" in
               *:"$SHA")
