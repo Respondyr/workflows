@@ -10,11 +10,26 @@
 #             doesn't pull these in).
 #   - Python: tests under `tests/integration/`. Invoked via
 #             `pytest tests/integration/ -v --tb=short`.
+#   - Hybrid: Go test step then Python pytest step, in the same job. Used
+#             by Go services that share the Python API-level integration
+#             suite (qa was authored in pytest; translating to Go per
+#             repo would duplicate HTTP client wiring).
 #
 # Per-service concurrency group serializes PR runs against the shared dev
 # cluster. PRs targeting the same service queue; PRs across services run
 # in parallel. Trade-off accepted in PLAN-AUTOMATED-RELEASE-WORKFLOWS.html:
 # simpler than per-PR tenant scoping, revisit if AI PR volume saturates.
+#
+# Auth bootstrap (auth_required: true):
+#   Assumes respondyr-gha-dev via OIDC (same trust chain as
+#   verify-deployment.yml), reads platform/integration-tests/dev from AWS
+#   Secrets Manager, and exports ACCOUNTS_INTERNAL_TOKEN /
+#   BILLING_INTERNAL_TOKEN / REVIEWS_INTERNAL_TOKEN to the test env. The
+#   blob is provisioned by infra/terraform/platform-secrets/
+#   integration-tests-secrets.tf; the IAM grant lives in
+#   infra/terraform/shared/env-dev/02-ci-verify-deployment.tf.
+#   Defaults to false so tests that only need public endpoints stay
+#   simple.
 
 name: Integration Test
 
@@ -22,7 +37,7 @@ on:
   workflow_call:
     inputs:
       language:
-        description: "go | python"
+        description: "go | python | hybrid"
         required: true
         type: string
       service_name:
@@ -39,6 +54,31 @@ on:
         required: false
         type: number
         default: 15
+      auth_required:
+        description: |
+          When true, assume respondyr-gha-dev and load internal bearer
+          tokens from platform/integration-tests/dev into the test env
+          (ACCOUNTS_INTERNAL_TOKEN, BILLING_INTERNAL_TOKEN,
+          REVIEWS_INTERNAL_TOKEN). Tests that mint a Cognito session via
+          /accounts/internal/admin/qa/mint-session or call the
+          per-service internal routes (entitlements, ingest) need this.
+        required: false
+        type: boolean
+        default: false
+      aws_role_arn:
+        description: |
+          IAM role to assume when auth_required is true. Defaults to the
+          dev respondyr-gha-dev role; override for a future prod path.
+        required: false
+        type: string
+        default: "arn:aws:iam::987213268382:role/respondyr-gha-dev"
+      itest_secret_id:
+        description: |
+          AWS SM secret-id to read internal tokens from when auth_required
+          is true. Default: platform/integration-tests/dev.
+        required: false
+        type: string
+        default: "platform/integration-tests/dev"
       # --- Go ---
       go_version:
         required: false
@@ -92,9 +132,37 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # --- Auth bootstrap (auth_required) ---
+      # Same OIDC chain verify-deployment uses. Loads three internal
+      # bearer tokens from platform/integration-tests/dev and exports
+      # them as masked env vars so the test process inherits them.
+      - name: Configure AWS credentials
+        if: inputs.auth_required
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-2' }}
+
+      - name: Fetch internal tokens from Secrets Manager
+        if: inputs.auth_required
+        run: |
+          set -euo pipefail
+          BLOB=$(aws secretsmanager get-secret-value \
+            --secret-id "${{ inputs.itest_secret_id }}" \
+            --query SecretString --output text)
+          for KEY in ACCOUNTS_INTERNAL_TOKEN BILLING_INTERNAL_TOKEN REVIEWS_INTERNAL_TOKEN; do
+            VAL=$(echo "$BLOB" | jq -r --arg k "$KEY" '.[$k]')
+            if [ -z "$VAL" ] || [ "$VAL" = "null" ]; then
+              echo "::error::SM blob ${{ inputs.itest_secret_id }} has no '$KEY' field"
+              exit 1
+            fi
+            echo "::add-mask::$VAL"
+            echo "$KEY=$VAL" >> "$GITHUB_ENV"
+          done
+
       # --- Private-dep clones (Go only) ---
       - name: Generate GitHub App token
-        if: inputs.language == 'go' && (inputs.has_auth_dep || inputs.has_rabbit_dep)
+        if: (inputs.language == 'go' || inputs.language == 'hybrid') && (inputs.has_auth_dep || inputs.has_rabbit_dep)
         id: app-token
         uses: actions/create-github-app-token@v2
         with:
@@ -104,47 +172,49 @@ jobs:
           repositories: auth-go,shared-go-rabbit
 
       - name: Clone auth-go for replace directive
-        if: inputs.language == 'go' && inputs.has_auth_dep
+        if: (inputs.language == 'go' || inputs.language == 'hybrid') && inputs.has_auth_dep
         run: |
           git clone --depth 1 \
             https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/Respondyr/auth-go.git \
             ${{ github.workspace }}/../auth-go
 
       - name: Clone shared-go-rabbit for replace directive
-        if: inputs.language == 'go' && inputs.has_rabbit_dep
+        if: (inputs.language == 'go' || inputs.language == 'hybrid') && inputs.has_rabbit_dep
         run: |
           git clone --depth 1 \
             https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/Respondyr/shared-go-rabbit.git \
             ${{ github.workspace }}/../shared-go-rabbit
 
-      # --- Go path ---
+      # --- Go path (go | hybrid) ---
       - name: Set up Go
-        if: inputs.language == 'go'
+        if: inputs.language == 'go' || inputs.language == 'hybrid'
         uses: actions/setup-go@v5
         with:
           go-version: ${{ inputs.go_version }}
           cache: true
 
       - name: Run Go integration tests
-        if: inputs.language == 'go'
+        if: inputs.language == 'go' || inputs.language == 'hybrid'
         run: |
           set -euo pipefail
           echo "DEV_BASE_URL=$DEV_BASE_URL"
           go test ${{ inputs.go_test_args }}
 
-      # --- Python path ---
+      # --- Python path (python | hybrid) ---
       - name: Set up Python
-        if: inputs.language == 'python'
+        if: inputs.language == 'python' || inputs.language == 'hybrid'
         uses: actions/setup-python@v6
         with:
           python-version: ${{ inputs.python_version }}
 
       - name: Install Python deps (pip)
-        if: inputs.language == 'python' && inputs.install_method == 'pip'
+        if: (inputs.language == 'python' && inputs.install_method == 'pip') || inputs.language == 'hybrid'
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest httpx 2>/dev/null || true
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+          pip install pytest httpx requests
 
       - name: Configure git for private deps (editable)
         if: inputs.language == 'python' && inputs.install_method == 'editable'
@@ -157,7 +227,7 @@ jobs:
           pip install -e ".[dev]"
 
       - name: Run Python integration tests
-        if: inputs.language == 'python'
+        if: inputs.language == 'python' || inputs.language == 'hybrid'
         run: |
           set -euo pipefail
           echo "DEV_BASE_URL=$DEV_BASE_URL"
