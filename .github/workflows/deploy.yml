@@ -221,7 +221,11 @@ jobs:
     name: Docker Build & Push
     needs: [test]
     if: ${{ always() && !failure() && !cancelled() && inputs.has_docker }}
-    runs-on: ubuntu-latest
+    # Native arm64 runner — EKS nodes are Graviton (BOTTLEROCKET_ARM_64,
+    # m7g) so images target linux/arm64. Building on amd64 ubuntu-latest
+    # forced QEMU emulation (~20 min Go compiles); a native arm64 runner
+    # builds the same target without emulation. Mirrors docker-build.yml.
+    runs-on: ubuntu-24.04-arm
     outputs:
       image_tag: ${{ github.sha }}
       image_ref: ${{ steps.meta.outputs.image_ref }}
