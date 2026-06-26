@@ -221,7 +221,11 @@ jobs:
     name: Docker Build & Push
     needs: [test]
     if: ${{ always() && !failure() && !cancelled() && inputs.has_docker }}
-    runs-on: ubuntu-latest
+    # Native ARM64 runner — service images are linux/arm64 (matches EKS Graviton
+    # nodes). Building arm64 on the amd64 ubuntu-latest runner falls back to QEMU
+    # emulation (~5-8× slower); no QEMU needed when runner arch == target.
+    # Mirrors docker-build.yml (the PR-pipeline build), which already runs native.
+    runs-on: ubuntu-24.04-arm
     outputs:
       image_tag: ${{ github.sha }}
       image_ref: ${{ steps.meta.outputs.image_ref }}
