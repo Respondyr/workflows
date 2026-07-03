@@ -66,18 +66,34 @@ jobs:
       - name: Clone and stage auth-go for Docker build
         if: inputs.has_auth_dep
         run: |
-          git clone --depth 1 \
-            https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/Respondyr/auth-go.git \
-            /tmp/auth-go
+          # App installation tokens can lag a few seconds behind minting; GitHub
+          # reports the repo as not found until the token propagates, so retry.
+          for attempt in 1 2 3; do
+            git clone --depth 1 \
+              https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/Respondyr/auth-go.git \
+              /tmp/auth-go && break
+            rm -rf "/tmp/auth-go"
+            if [ "$attempt" = 3 ]; then exit 1; fi
+            echo "clone failed (attempt $attempt), retrying in 5s..."
+            sleep 5
+          done
           mkdir -p .deps
           cp -r /tmp/auth-go .deps/auth-go
 
       - name: Clone and stage shared-go-rabbit for Docker build
         if: inputs.has_rabbit_dep
         run: |
-          git clone --depth 1 \
-            https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/Respondyr/shared-go-rabbit.git \
-            /tmp/shared-go-rabbit
+          # App installation tokens can lag a few seconds behind minting; GitHub
+          # reports the repo as not found until the token propagates, so retry.
+          for attempt in 1 2 3; do
+            git clone --depth 1 \
+              https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/Respondyr/shared-go-rabbit.git \
+              /tmp/shared-go-rabbit && break
+            rm -rf "/tmp/shared-go-rabbit"
+            if [ "$attempt" = 3 ]; then exit 1; fi
+            echo "clone failed (attempt $attempt), retrying in 5s..."
+            sleep 5
+          done
           mkdir -p .deps
           cp -r /tmp/shared-go-rabbit .deps/shared-go-rabbit
 

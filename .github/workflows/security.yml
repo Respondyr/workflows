@@ -71,9 +71,17 @@ jobs:
       - name: Clone auth-go for replace directive
         if: inputs.language == 'go' && inputs.has_auth_dep
         run: |
-          git clone --depth 1 \
-            https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/Respondyr/auth-go.git \
-            ${{ github.workspace }}/../auth-go
+          # App installation tokens can lag a few seconds behind minting; GitHub
+          # reports the repo as not found until the token propagates, so retry.
+          for attempt in 1 2 3; do
+            git clone --depth 1 \
+              https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/Respondyr/auth-go.git \
+              ${{ github.workspace }}/../auth-go && break
+            rm -rf "${{ github.workspace }}/../auth-go"
+            if [ "$attempt" = 3 ]; then exit 1; fi
+            echo "clone failed (attempt $attempt), retrying in 5s..."
+            sleep 5
+          done
 
       - name: Run govulncheck
         if: inputs.language == 'go'
