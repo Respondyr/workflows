@@ -94,7 +94,12 @@ jobs:
         run: go vet ./...
 
       - name: Test
-        run: go test ./...
+        # -timeout 25m: go test's default 10m panic-kills large suites on CI
+        # runners. accounts' internal/server suite (a Postgres testcontainer
+        # per test, 57+ migrations each) crossed 10m on 2026-07-03 when the
+        # SCIM tests landed; runners are ~2-3x slower than dev machines. The
+        # job-level runner timeout still bounds a genuine hang.
+        run: go test -timeout 25m ./...
 
       - name: Build
         run: go build -o /dev/null ${{ inputs.build_target }}
