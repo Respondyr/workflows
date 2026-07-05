@@ -96,6 +96,19 @@ on:
         required: false
         type: string
         default: "npm run build"
+      # Helm values collapse: let a service point dev/prod image-tag writes at
+      # its collapsed per-env file. Defaults preserve the legacy layout, so
+      # non-collapsed services are unaffected (backward-compatible).
+      dev_values_file:
+        description: "Dev Helm values file the image tag is written into"
+        required: false
+        type: string
+        default: "helm/values-dev.yaml"
+      prod_values_file:
+        description: "Prod Helm values file the image tag is written into"
+        required: false
+        type: string
+        default: "helm/values-prod.yaml"
 
 permissions:
   id-token: write
@@ -356,6 +369,7 @@ jobs:
     with:
       service_name: ${{ inputs.service_name }}
       image_tag: ${{ needs.docker.outputs.image_tag }}
+      values_file: ${{ inputs.dev_values_file }}
     secrets: inherit
 
   # ──────────────────────────────────────────────
@@ -561,6 +575,7 @@ jobs:
     with:
       version: ${{ needs.release.outputs.tag }}
       service_name: ${{ inputs.service_name }}
+      values_file: ${{ inputs.prod_values_file }}
     secrets: inherit
 
   # ──────────────────────────────────────────────
