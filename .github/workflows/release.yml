@@ -1,5 +1,16 @@
 name: Release
 
+# Versions the reusable workflow FILES in this repo. On every push to main,
+# for each component below, analyzes conventional commits touching that file
+# since its last semver tag, bumps major/minor/patch, cuts an immutable
+# <comp>/vX.Y.Z release, and force-moves the floating <comp>/vX major tag to
+# the released commit so callers pinned at @<comp>/vN track the latest
+# compatible version automatically.
+#
+# NOTE: This is NOT semver-release.yml. That file is a reusable workflow that
+# SERVICE repos call to version their own app + retag their ECR image. This
+# file versions the workflows in this repo.
+
 on:
   push:
     branches: [main]
@@ -20,84 +31,110 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
 
-          # Map component name → workflow file path
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Component name → workflow file path.
+          # MUST cover every file a service repo can `uses:`. A file missing
+          # here never gets a tag, so callers cannot pin it to a floating
+          # major and are forced onto @main (the drift this repo is fixing).
           declare -A COMPONENTS=(
             [go-ci]=".github/workflows/go-ci.yml"
             [python-ci]=".github/workflows/python-ci.yml"
             [frontend-ci]=".github/workflows/frontend-ci.yml"
-            [deploy]=".github/workflows/deploy.yml"
             [security]=".github/workflows/security.yml"
             [e2e-tests]=".github/workflows/e2e-tests.yml"
+            [deploy]=".github/workflows/deploy.yml"
+            [deploy-dev]=".github/workflows/deploy-dev.yml"
+            [deploy-prod-gitops]=".github/workflows/deploy-prod-gitops.yml"
+            [docker-build]=".github/workflows/docker-build.yml"
+            [verify-deployment]=".github/workflows/verify-deployment.yml"
+            [integration-test]=".github/workflows/integration-test.yml"
+            [semver-release]=".github/workflows/semver-release.yml"
           )
+
+          FAILED=""
 
           for COMPONENT in "${!COMPONENTS[@]}"; do
             FILE="${COMPONENTS[$COMPONENT]}"
 
-            # Find latest semver tag for this component
-            LAST_TAG=$(git tag --sort=-v:refname | grep -E "^${COMPONENT}/v[0-9]+\.[0-9]+\.[0-9]+$" | head -1 || true)
-            if [ -z "$LAST_TAG" ]; then
-              RANGE="HEAD"
-              VERSION="0.0.0"
-            else
-              RANGE="${LAST_TAG}..HEAD"
-              VERSION=$(echo "$LAST_TAG" | sed "s|^${COMPONENT}/v||")
-            fi
+            # Isolate each component: a failure here must not abort the others,
+            # and must not leave the floating tag half-updated for siblings.
+            (
+              set -e
 
-            # Get commits in range that touch this component's file
-            COMMITS=$(git log "$RANGE" --pretty=format:"%s" -- "$FILE" 2>/dev/null || true)
-            if [ -z "$COMMITS" ]; then
-              echo "[$COMPONENT] No commits touching $FILE since $LAST_TAG — skipping"
-              continue
-            fi
+              # Latest immutable semver tag for this component.
+              LAST_TAG=$(git tag --sort=-v:refname | grep -E "^${COMPONENT}/v[0-9]+\.[0-9]+\.[0-9]+$" | head -1 || true)
+              if [ -z "$LAST_TAG" ]; then
+                RANGE="HEAD"
+                VERSION="0.0.0"
+              else
+                RANGE="${LAST_TAG}..HEAD"
+                VERSION=$(echo "$LAST_TAG" | sed "s|^${COMPONENT}/v||")
+              fi
 
-            # Determine bump level
-            MAJOR=$(echo "$VERSION" | cut -d. -f1)
-            MINOR=$(echo "$VERSION" | cut -d. -f2)
-            PATCH=$(echo "$VERSION" | cut -d. -f3)
+              # Only commits that actually touched this component's file count.
+              COMMITS=$(git log "$RANGE" --pretty=format:"%s" -- "$FILE" 2>/dev/null || true)
+              if [ -z "$COMMITS" ]; then
+                echo "[$COMPONENT] No commits touching $FILE since ${LAST_TAG:-<none>} — skipping"
+                exit 0
+              fi
 
-            HAS_BREAKING=$(echo "$COMMITS" | grep -cE "^[a-z]+(\(.+\))?!:|BREAKING CHANGE" || true)
-            HAS_FEAT=$(echo "$COMMITS" | grep -cE "^feat" || true)
-            HAS_PATCH=$(echo "$COMMITS" | grep -cE "^(fix|refactor|perf|chore|ci|build|test)" || true)
+              MAJOR=$(echo "$VERSION" | cut -d. -f1)
+              MINOR=$(echo "$VERSION" | cut -d. -f2)
+              PATCH=$(echo "$VERSION" | cut -d. -f3)
 
-            if [ "$HAS_BREAKING" -gt 0 ]; then
-              MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0
-            elif [ "$HAS_FEAT" -gt 0 ]; then
-              MINOR=$((MINOR + 1)); PATCH=0
-            elif [ "$HAS_PATCH" -gt 0 ]; then
-              PATCH=$((PATCH + 1))
-            else
-              echo "[$COMPONENT] No conventional commits — skipping"
-              continue
-            fi
+              HAS_BREAKING=$(echo "$COMMITS" | grep -cE "^[a-z]+(\(.+\))?!:|BREAKING CHANGE" || true)
+              HAS_FEAT=$(echo "$COMMITS" | grep -cE "^feat" || true)
+              HAS_PATCH=$(echo "$COMMITS" | grep -cE "^(fix|refactor|perf|chore|ci|build|test)" || true)
 
-            NEW_TAG="${COMPONENT}/v${MAJOR}.${MINOR}.${PATCH}"
-            FLOATING_TAG="${COMPONENT}/v${MAJOR}"
+              if [ "$HAS_BREAKING" -gt 0 ]; then
+                MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0
+              elif [ "$HAS_FEAT" -gt 0 ]; then
+                MINOR=$((MINOR + 1)); PATCH=0
+              elif [ "$HAS_PATCH" -gt 0 ]; then
+                PATCH=$((PATCH + 1))
+              else
+                echo "[$COMPONENT] No conventional commits — skipping"
+                exit 0
+              fi
 
-            echo "[$COMPONENT] Bumping to $NEW_TAG"
+              NEW_TAG="${COMPONENT}/v${MAJOR}.${MINOR}.${PATCH}"
+              FLOATING_TAG="${COMPONENT}/v${MAJOR}"
 
-            # Generate changelog
-            BODY=""
-            FEATS=$(echo "$COMMITS" | grep -E "^feat" | sed 's/^feat[^:]*: //' | sed 's/^/- /' || true)
-            FIXES=$(echo "$COMMITS" | grep -E "^fix" | sed 's/^fix[^:]*: //' | sed 's/^/- /' || true)
-            OTHER=$(echo "$COMMITS" | grep -E "^(refactor|perf|chore|ci|build|test)" | sed 's/^[^:]*: //' | sed 's/^/- /' || true)
+              echo "[$COMPONENT] Bumping to $NEW_TAG (floating: $FLOATING_TAG)"
 
-            [ -n "$FEATS" ] && BODY="${BODY}## Features\n${FEATS}\n\n"
-            [ -n "$FIXES" ] && BODY="${BODY}## Bug Fixes\n${FIXES}\n\n"
-            [ -n "$OTHER" ] && BODY="${BODY}## Other Changes\n${OTHER}\n\n"
+              # Changelog
+              BODY=""
+              FEATS=$(echo "$COMMITS" | grep -E "^feat" | sed 's/^feat[^:]*: //' | sed 's/^/- /' || true)
+              FIXES=$(echo "$COMMITS" | grep -E "^fix" | sed 's/^fix[^:]*: //' | sed 's/^/- /' || true)
+              OTHER=$(echo "$COMMITS" | grep -E "^(refactor|perf|chore|ci|build|test)" | sed 's/^[^:]*: //' | sed 's/^/- /' || true)
+              [ -n "$FEATS" ] && BODY="${BODY}## Features\n${FEATS}\n\n"
+              [ -n "$FIXES" ] && BODY="${BODY}## Bug Fixes\n${FIXES}\n\n"
+              [ -n "$OTHER" ] && BODY="${BODY}## Other Changes\n${OTHER}\n\n"
 
-            # Create GitHub release
-            echo -e "$BODY" | gh release create "$NEW_TAG" \
-              --title "$NEW_TAG" \
-              --notes-file - \
-              --target main
+              echo -e "$BODY" | gh release create "$NEW_TAG" \
+                --title "$NEW_TAG" \
+                --notes-file - \
+                --target "$GITHUB_SHA"
 
-            # Update floating major tag
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git tag -f "$FLOATING_TAG" HEAD
-            git push origin "$FLOATING_TAG" --force
-
-            echo "[$COMPONENT] Released $NEW_TAG (floating: $FLOATING_TAG)"
+              # Force-move the floating major to the released commit. This is
+              # the step that previously did not stick, stranding floats behind
+              # main. Verify the push landed; fail the component if it did not.
+              git tag -f "$FLOATING_TAG" "$GITHUB_SHA"
+              git push origin "refs/tags/${FLOATING_TAG}" --force
+              REMOTE_SHA=$(git ls-remote origin "refs/tags/${FLOATING_TAG}" | cut -f1)
+              if [ "$REMOTE_SHA" != "$GITHUB_SHA" ]; then
+                echo "::error::[$COMPONENT] floating tag $FLOATING_TAG did not advance to $GITHUB_SHA (remote=$REMOTE_SHA)"
+                exit 1
+              fi
+              echo "[$COMPONENT] Released $NEW_TAG; floating $FLOATING_TAG → $GITHUB_SHA"
+            ) || FAILED="${FAILED} ${COMPONENT}"
           done
+
+          if [ -n "$FAILED" ]; then
+            echo "::error::Release failed for components:${FAILED}"
+            exit 1
+          fi
