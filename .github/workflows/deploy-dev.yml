@@ -26,6 +26,11 @@ on:
         description: "Image tag to deploy (git SHA)"
         required: true
         type: string
+      values_file:
+        description: "Dev Helm values file to bump (relative to repo root)"
+        required: false
+        type: string
+        default: "helm/values-dev.yaml"
 
 permissions:
   contents: write
@@ -42,6 +47,8 @@ jobs:
     name: Deploy to Dev (gitops)
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    env:
+      VALUES_FILE: ${{ inputs.values_file }}
     steps:
       - name: Generate GitHub App token
         id: app-token
@@ -68,15 +75,19 @@ jobs:
           # `yq -i` will silently materialize missing parents, leaving the
           # file structurally wrong but with our new tag inside. Fail loudly
           # if `base-service.deployment` isn't already present.
-          if ! yq e '.base-service.deployment // ""' helm/values-dev.yaml | grep -q .; then
-            echo "::error::helm/values-dev.yaml is missing the .base-service.deployment block — refusing to bump"
+          if [ ! -f "$VALUES_FILE" ]; then
+            echo "::error::values file $VALUES_FILE does not exist — refusing to bump"
+            exit 1
+          fi
+          if ! yq e '.base-service.deployment // ""' "$VALUES_FILE" | grep -q .; then
+            echo "::error::$VALUES_FILE is missing the .base-service.deployment block — refusing to bump"
             exit 1
           fi
 
       - name: Read current tag
         id: current
         run: |
-          CURRENT_TAG=$(yq '.base-service.deployment.image.tag // ""' helm/values-dev.yaml)
+          CURRENT_TAG=$(yq '.base-service.deployment.image.tag // ""' "$VALUES_FILE")
           echo "tag=$CURRENT_TAG" >> "$GITHUB_OUTPUT"
           echo "Current tag: $CURRENT_TAG"
 
@@ -90,9 +101,9 @@ jobs:
         if: steps.current.outputs.tag != inputs.image_tag
         run: |
           export VERSION="${{ inputs.image_tag }}"
-          yq -i '.base-service.deployment.image.tag = strenv(VERSION)' helm/values-dev.yaml
+          yq -i '.base-service.deployment.image.tag = strenv(VERSION)' "$VALUES_FILE"
           echo "Updated tag to $VERSION"
-          git diff helm/values-dev.yaml | head -20
+          git diff "$VALUES_FILE" | head -20
 
       - name: Commit and push (with rebase retry)
         if: steps.current.outputs.tag != inputs.image_tag
@@ -105,7 +116,7 @@ jobs:
           export VERSION="${{ inputs.image_tag }}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add helm/values-dev.yaml
+          git add "$VALUES_FILE"
           git commit -m "deploy: bump dev image tag for ${{ inputs.service_name }} to ${VERSION} [skip ci]"
           for attempt in 1 2 3; do
             if git pull --rebase origin main; then
