@@ -1,0 +1,97 @@
+name: Reconcile Floating Majors
+
+# One-shot maintenance job (manual dispatch only).
+#
+# Brings every component's floating major tag <comp>/vN into sync with the
+# CURRENT main. Needed because (a) the float-move in release.yml previously
+# failed to stick, stranding floats behind main, and (b) newly-mapped
+# components have no float yet, so callers cannot pin them.
+#
+# The float is moved to main HEAD. That commit's file content is IDENTICAL to
+# what @main callers already run today, so repointing a caller from @main to
+# @<comp>/vN after this runs is a no-op in behavior — regression-free by
+# construction. Run once before the V1 caller repoint; it is idempotent and
+# safe to re-run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "List intended tag moves without pushing"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Reconcile floats to main
+        run: |
+          set -uo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Keep in lockstep with release.yml's COMPONENTS map.
+          COMPONENTS="go-ci python-ci frontend-ci security e2e-tests deploy deploy-dev deploy-prod-gitops docker-build verify-deployment integration-test semver-release"
+
+          DRY_RUN="${{ inputs.dry_run }}"
+          HEAD_SHA=$(git rev-parse HEAD)
+          echo "main HEAD = $HEAD_SHA  (dry_run=$DRY_RUN)"
+          echo ""
+
+          for COMPONENT in $COMPONENTS; do
+            # Major to reconcile = major of the latest immutable semver tag,
+            # or 0 if the component has never been released.
+            LAST_TAG=$(git tag --sort=-v:refname | grep -E "^${COMPONENT}/v[0-9]+\.[0-9]+\.[0-9]+$" | head -1 || true)
+            if [ -z "$LAST_TAG" ]; then
+              MAJOR=0
+              SEED_NEEDED=1
+            else
+              MAJOR=$(echo "$LAST_TAG" | sed "s|^${COMPONENT}/v||" | cut -d. -f1)
+              SEED_NEEDED=0
+            fi
+            FLOAT="${COMPONENT}/v${MAJOR}"
+
+            CUR=$(git ls-remote origin "refs/tags/${FLOAT}" | cut -f1)
+            if [ "$CUR" = "$HEAD_SHA" ]; then
+              echo "[$COMPONENT] $FLOAT already at HEAD — ok"
+              continue
+            fi
+            echo "[$COMPONENT] $FLOAT: ${CUR:-<absent>} → $HEAD_SHA"
+
+            if [ "$DRY_RUN" = "true" ]; then
+              [ "$SEED_NEEDED" = "1" ] && echo "[$COMPONENT] would also seed immutable ${COMPONENT}/v${MAJOR}.0.0"
+              continue
+            fi
+
+            # Seed an immutable snapshot so there is an escape-hatch pin for
+            # never-released components.
+            if [ "$SEED_NEEDED" = "1" ]; then
+              SEED_TAG="${COMPONENT}/v${MAJOR}.0.0"
+              if ! git ls-remote --exit-code origin "refs/tags/${SEED_TAG}" >/dev/null 2>&1; then
+                git tag "$SEED_TAG" "$HEAD_SHA"
+                git push origin "refs/tags/${SEED_TAG}"
+                echo "[$COMPONENT] seeded $SEED_TAG"
+              fi
+            fi
+
+            git tag -f "$FLOAT" "$HEAD_SHA"
+            git push origin "refs/tags/${FLOAT}" --force
+            REMOTE_SHA=$(git ls-remote origin "refs/tags/${FLOAT}" | cut -f1)
+            if [ "$REMOTE_SHA" != "$HEAD_SHA" ]; then
+              echo "::error::[$COMPONENT] $FLOAT did not advance (remote=$REMOTE_SHA)"
+              exit 1
+            fi
+            echo "[$COMPONENT] $FLOAT → HEAD ✓"
+          done
