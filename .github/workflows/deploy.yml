@@ -43,6 +43,11 @@ on:
         required: false
         type: boolean
         default: false
+      docs_triggers_release:
+        description: "Treat docs:-only changes as release-worthy (patch bump) instead of skipping. Opt-in; keeps the KB/docs in prod current."
+        required: false
+        type: boolean
+        default: false
       # Go-specific
       go_version:
         description: "Go version"
@@ -455,12 +460,18 @@ jobs:
           HAS_BREAKING=$(echo "$COMMITS" | grep -cE "^[a-z]+(\(.+\))?!:|BREAKING CHANGE" || true)
           HAS_FEAT=$(echo "$COMMITS" | grep -cE "^feat" || true)
           HAS_PATCH=$(echo "$COMMITS" | grep -cE "^(fix|refactor|perf|chore|ci|build|test)" || true)
+          # Opt-in (docs_triggers_release): a docs:-only change would normally
+          # skip the release, leaving a service's shipped docs/KB stale in prod.
+          # When enabled, docs: counts as a patch bump so the change reaches prod.
+          HAS_DOCS=$(echo "$COMMITS" | grep -cE "^docs" || true)
 
           if [ "$HAS_BREAKING" -gt 0 ]; then
             MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0
           elif [ "$HAS_FEAT" -gt 0 ]; then
             MINOR=$((MINOR + 1)); PATCH=0
           elif [ "$HAS_PATCH" -gt 0 ]; then
+            PATCH=$((PATCH + 1))
+          elif [ "${{ inputs.docs_triggers_release }}" = "true" ] && [ "$HAS_DOCS" -gt 0 ]; then
             PATCH=$((PATCH + 1))
           else
             echo "skip=true" >> "$GITHUB_OUTPUT"
