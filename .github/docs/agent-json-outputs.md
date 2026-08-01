@@ -4,12 +4,24 @@
 
 ## Why
 
-Agents (Claude Code in CI, the Slack DevOps agent, anything summoned into a
-pipeline) are only as useful as what they can read back from a run. Today our
+Agents (a coding agent in CI, a chat-ops bot, anything summoned into a
+pipeline) are only as useful as what they can read back from a run. Today the
 reusable workflows communicate through exit codes and logs. An agent that wants
 to know "what image did this build, where did it deploy, why did it fail" has
 to grep log text. The fix is a structured output contract: every reusable
 workflow emits machine-readable JSON alongside its human-facing output.
+
+## Rules
+
+1. **Org and account neutral.** No hardcoded org names, AWS account IDs, or
+   service names anywhere in the contract. Callers supply all of them as
+   inputs; this design must drop into any GitHub org and any AWS account.
+2. **Language as input or fully unopinionated.** A workflow either accepts
+   `language` as an explicit input or has no language awareness at all. The
+   emitter and schemas never vary by language: one manifest shape for
+   everything.
+3. **DRY.** Emit logic exists exactly once, in `actions/emit`. No workflow
+   hand-rolls JSON into `$GITHUB_OUTPUT`.
 
 ## Design
 
@@ -62,22 +74,20 @@ runs:
         { echo '```json'; echo "$JSON" | jq .; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 ```
 
-The `env:` indirection is load-bearing: interpolating `${{ inputs.json }}`
-directly into the script body is a shell injection hole once agent-generated
-content flows through it.
-
 ### 2. Thread outputs up three layers
 
 Step output -> job `outputs:` -> `on.workflow_call.outputs`. Callers and agents
 read `needs.<job>.outputs.<name>` and parse with `fromJSON()`. Outputs are
 single-line strings, so always compact with `jq -c`.
 
-First target: `deploy.yml` emits a `manifest` output after the BUILD step:
+First target: `deploy.yml` (which already takes `language` as an input) emits
+a `manifest` output after the BUILD step. The shape is identical for every
+language and every caller:
 
 ```json
 {
-  "service": "reviews",
-  "image": "987213268382.dkr.ecr.us-east-1.amazonaws.com/reviews",
+  "service": "<service_name input>",
+  "image": "<aws-account-id>.dkr.ecr.<region>.amazonaws.com/<service_name>",
   "sha_tag": "abc1234",
   "digest": "sha256:...",
   "dev_synced": true,
@@ -103,7 +113,7 @@ twin of every machine output.
 - **Ref resolution:** inside a reusable workflow, `uses: ./actions/emit`
   resolves against the CALLER's checkout, not this repo. Reference the
   composite action by full path with a ref
-  (`Respondyr/workflows/actions/emit@v1`). Internal refs then need bumping at
+  (`<org>/<workflows-repo>/actions/emit@v1`). Internal refs then need bumping at
   release time; `semver-release.yml` + `reconcile-floats.yml` already manage
   floating major tags here, so extend that machinery rather than adding new.
 - **Silent drops:** any output whose value contains a masked secret is dropped
@@ -115,5 +125,6 @@ twin of every machine output.
 
 1. `actions/emit` + `schemas/` + manifest output from `deploy.yml` build step.
 2. Wire `go-ci.yml` / `python-ci.yml` / `frontend-ci.yml` to emit structured
-   test results the same way.
+   test results through the same emitter and schemas; only the producing
+   workflow differs per language, never the contract.
 3. `AGENTS.md` at repo root documenting the call/read contract for agents.
