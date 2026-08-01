@@ -1,4 +1,4 @@
-# UndercurrentSMB CI/CD Architecture
+# Respondyr CI/CD Architecture
 
 ## Principles
 
@@ -60,34 +60,37 @@ If a repo has no tests, the step either passes silently (Go) or is skipped via `
 
 ## Caller Pattern
 
-Every service repo has a single `.github/workflows/ci.yml`:
+Service repos split their callers across three thin workflow files. Every
+`uses:` ref pins a per-component **floating major tag** (`<workflow>/v0`),
+never `@main`: on each merge here, `release.yml` cuts an immutable
+`<workflow>/vX.Y.Z` tag per changed component and force-moves the float, so
+callers pick up compatible changes automatically (`reconcile-floats.yml`
+repairs drifted floats).
+
+| Caller file | Trigger | Calls |
+|-------------|---------|-------|
+| `pr.yml` | `pull_request` | `go-ci`, `docker-build`, `deploy-dev`, `verify-deployment`, `integration-test` |
+| `release.yml` | `push` to `main` | `deploy.yml` |
+| `deploy-prod.yml` | `workflow_dispatch` (takes a `version`) | `deploy-prod-gitops.yml` |
+
+Example jobs (`pr.yml` test job, `release.yml` deploy job):
 
 ```yaml
-name: CI
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-
-permissions:
-  contents: write
-  id-token: write
-  security-events: write
-
+# .github/workflows/pr.yml
 jobs:
-  ci:
-    if: github.event_name == 'pull_request'
-    uses: UndercurrentSMB/undercurrent-workflows/.github/workflows/go-ci.yml@main
+  test:
+    uses: Respondyr/workflows/.github/workflows/go-ci.yml@go-ci/v0
     with:
       has_auth_dep: true
       build_target: "./cmd/server"
     secrets: inherit
+```
 
+```yaml
+# .github/workflows/release.yml
+jobs:
   deploy:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    uses: UndercurrentSMB/undercurrent-workflows/.github/workflows/deploy.yml@main
+    uses: Respondyr/workflows/.github/workflows/deploy.yml@deploy/v0
     with:
       language: go
       service_name: my-service
@@ -127,9 +130,10 @@ jobs:
 ## Prerequisites
 
 - **AWS OIDC role** (`AWS_ROLE_ARN` secret) with ECR push/pull and Secrets Manager read
-- **ArgoCD tokens** in AWS Secrets Manager:
-  - `dev/undercurrentsmb/master-list` → `ARGOCD-DEV-TOKEN`
-  - `prod/undercurrentsmb/master-list` → `ARGOCD-PROD-TOKEN`
+- **ArgoCD CI credentials** in AWS Secrets Manager at
+  `platform/argocd/<environment>` (`ci-token` key) — read by
+  `verify-deployment.yml` only; deploys themselves are GitOps commits and
+  need no ArgoCD API token
 - **GitHub App** (`GH_APP_ID` + `GH_APP_PRIVATE_KEY`) for private dep access
 - **ECR repositories** matching `service_name` for each Docker service
 
