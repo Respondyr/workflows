@@ -160,3 +160,11 @@ images; prod ECR holds semver-tagged release artifacts. The
 release-please workflow re-tags + pushes to prod ECR (Phase 9 work).
 ECR cross-acct replication is NOT enabled — it can't filter on tag
 patterns, so enabling it would land SHA-tagged dev images in prod ECR.
+
+## Future Enhancements
+
+- **Agent-readable JSON output contract** — shared `actions/emit` composite
+  action, `schemas/` dir, typed `workflow_call` outputs so agents can read
+  pipeline results without grepping logs. Design + gotchas:
+  [.github/docs/agent-json-outputs.md](.github/docs/agent-json-outputs.md).
+  Proposed, not built.
