@@ -1,4 +1,4 @@
-# Respondyr CI/CD Architecture
+# CI/CD Architecture
 
 ## Principles
 
@@ -6,6 +6,7 @@
 2. **Convention over configuration.** The language tells you how to test. No test paths to configure.
 3. **No bot commits to main.** Deployments use ArgoCD API calls, not git commits to values files. No `[skip ci]` hacks, no push race conditions.
 4. **PR = fast feedback. Main = thorough pipeline.** PRs run lint + test only. Main merge runs security, Docker build, dev deploy, verification, release, and prod deploy.
+5. **Machine-readable outputs.** Every reusable workflow emits a typed JSON output contract so agents can read pipeline results without grepping logs. See [.github/docs/agent-json-outputs.md](.github/docs/agent-json-outputs.md).
 
 ## Flow
 
@@ -79,7 +80,7 @@ Example jobs (`pr.yml` test job, `release.yml` deploy job):
 # .github/workflows/pr.yml
 jobs:
   test:
-    uses: Respondyr/workflows/.github/workflows/go-ci.yml@go-ci/v0
+    uses: <org>/<repo-name>/.github/workflows/go-ci.yml@go-ci/v0
     with:
       has_auth_dep: true
       build_target: "./cmd/server"
@@ -90,7 +91,7 @@ jobs:
 # .github/workflows/release.yml
 jobs:
   deploy:
-    uses: Respondyr/workflows/.github/workflows/deploy.yml@deploy/v0
+    uses: <org>/<repo-name>/.github/workflows/deploy.yml@deploy/v0
     with:
       language: go
       service_name: my-service
@@ -142,11 +143,11 @@ jobs:
 Per-account OIDC roles for CI assume-role. Set `AWS_ROLE_ARN` repo secret
 to the appropriate ARN per job:
 
-- **Dev acct** — `arn:aws:iam::987213268382:role/respondyr-gha-dev`
-  - Trust: any branch/tag in any `Respondyr/*` repo.
+- **Dev acct** — `arn:aws:iam::<dev-account-id>:role/<gha-dev-role>`
+  - Trust: any branch/tag in any `<org>/*` repo.
   - Perms: ECR push on dev acct repos + S3 R/W on the shared TF state
     bucket (`respondyr-platform-terraform-state`). No `DeleteObject`.
-- **Prod acct** — `arn:aws:iam::489889952183:role/respondyr-gha-prod`
+- **Prod acct** — `arn:aws:iam::<prod-account-id>:role/<gha-prod-role>`
   - Trust: **release-please semver tag refs only** (`refs/tags/v*`). PR
     builds and main pushes CANNOT assume this role.
   - Perms: ECR push on prod acct repos. No state access.
@@ -165,10 +166,9 @@ release-please workflow re-tags + pushes to prod ECR (Phase 9 work).
 ECR cross-acct replication is NOT enabled — it can't filter on tag
 patterns, so enabling it would land SHA-tagged dev images in prod ECR.
 
-## Future Enhancements
+## Requirements — Not Yet Implemented
 
-- **Agent-readable JSON output contract** — shared `actions/emit` composite
-  action, `schemas/` dir, typed `workflow_call` outputs so agents can read
-  pipeline results without grepping logs. Design + gotchas:
-  [.github/docs/agent-json-outputs.md](.github/docs/agent-json-outputs.md).
-  Proposed, not built.
+- **Agent-readable JSON output contract** (Principle 5) — shared `actions/emit`
+  composite action, `schemas/` dir, typed `workflow_call` outputs. Design +
+  gotchas: [.github/docs/agent-json-outputs.md](.github/docs/agent-json-outputs.md).
+  Required; implementation pending.
