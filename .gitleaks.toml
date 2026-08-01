@@ -1,5 +1,5 @@
 [allowlist]
-  description = "Global allowlist for Undercurrent repos"
+  description = "Global allowlist for Respondyr repos"
   regexes = [
     # Test fixtures — not real secrets
     '''test[-_]secret''',
