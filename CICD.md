@@ -146,7 +146,7 @@ to the appropriate ARN per job:
 - **Dev acct** — `arn:aws:iam::<dev-account-id>:role/<gha-dev-role>`
   - Trust: any branch/tag in any `<org>/*` repo.
   - Perms: ECR push on dev acct repos + S3 R/W on the shared TF state
-    bucket (`respondyr-platform-terraform-state`). No `DeleteObject`.
+    bucket (`<terraform-state-bucket>`). No `DeleteObject`.
 - **Prod acct** — `arn:aws:iam::<prod-account-id>:role/<gha-prod-role>`
   - Trust: **release-please semver tag refs only** (`refs/tags/v*`). PR
     builds and main pushes CANNOT assume this role.
