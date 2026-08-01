@@ -122,11 +122,11 @@ jobs:
 
 ## Repo Categories
 
-**Full pipeline (Docker + ArgoCD):** accounts, billing, brand, comms, reviews, ai
+**Full pipeline (Docker + ArgoCD):** deployable services (default inputs)
 
-**Docker only (no ArgoCD):** deploy-listener (`argocd_enabled: false`)
+**Docker only (no ArgoCD):** image-publishing repos (`argocd_enabled: false`)
 
-**Library (no Docker, no deploy):** auth-go, intel, outreach (`has_docker: false`)
+**Library (no Docker, no deploy):** shared libraries (`has_docker: false`)
 
 ## Prerequisites
 
